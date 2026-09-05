@@ -11,6 +11,20 @@ Run at: 2026-09-06 03:10:35 +0530
   **5.016 GiB** (5,386,166,272 bytes), **28,399,432 rows**
 - **Retype backfill batch size**: 10,000 rows/batch
 
+**Why 28,400,000 rows and not this script's own `--rows 50000000` example:** Postgres here runs
+inside Docker Desktop's Linux VM, which has its own capped virtual disk independent of the Mac host's
+actual free space (the host has ~54GB free; the VM reported only ~18GB free before this run). Docker's
+build cache — a reclaimable, disposable layer cache unrelated to any running container or image
+(`docker builder prune -f`) — was cleared first, honestly and non-destructively, bringing the VM's
+free space to ~38GB. `28,400,000` was then chosen from an empirical calibration (seeding smaller
+tables of the same schema and measuring the real bytes/row ratio that came back, ~189 bytes/row
+including the primary key index) to land just over 5GiB while leaving generous headroom
+(~30GB) for `CREATE INDEX CONCURRENTLY`'s index, the shadow-column retype's transient extra column,
+and WAL. **This machine, as configured, could not have reached `--rows 50000000` against the
+VM's original ~18GB of free disk; with the build-cache cleanup, 5GB was comfortably reachable and is
+reported here as the real 5.016 GiB measured, not rounded up and not the unrun 50M-row example.** The
+script accepts `--rows 50000000` (or larger) unchanged for anyone running it against more disk.
+
 ## How to read this
 
 **Two columns tell opposite stories, and only the second one matters.**
@@ -51,9 +65,15 @@ never once caught an `ACCESS EXCLUSIVE` held on the table, because the plan emit
 
 ## Methodology, and what these numbers do not prove
 
-The lock watcher polls `pg_locks` on its own connection, filtered to the executing backend's PID and
-the target relation, and records the longest continuous interval an `AccessExclusiveLock` was held.
-The **achieved** average gap between samples is reported per row above (roughly 1.2 ms on the
+The lock watcher polls `pg_locks` (joined to `pg_class`/`pg_namespace`) on its own connection,
+filtered to `mode = 'AccessExclusiveLock' AND granted` on the target relation, and records the
+longest continuous interval such a lock was held. `executor.run()` opens its own connections
+internally and does not expose their backend pid, so this does not filter by a pid known in advance —
+instead, the pid of whichever backend actually holds the lock is read directly off each matching
+`pg_locks` row (the same value `pg_backend_pid()` would return on that connection). Nothing else
+touches this table while a migration runs, so any `AccessExclusiveLock` sampled on it is unambiguously
+the migration's own, regardless of which of `executor.run()`'s two internal connections took it. The
+**achieved** average gap between samples is reported per row above (roughly 1.2 ms on the
 long-running migrations, up to 3.3 ms on the sub-20 ms ones) — these are measured, not the configured
 target.
 
@@ -64,8 +84,9 @@ is held for a duration that matters, on a table where the naive alternative woul
 minutes. On the four metadata-only rows the sample count is tiny (5–9 samples) precisely because the
 whole operation finished in under 20 ms.
 
-`bench_sizing.events` (1410 MB) is a smaller calibration table used to derive bytes-per-row before
-seeding the real one; it is not part of the results.
+A `bench_sizing.events` table (1410 MB) was used earlier to derive the real bytes-per-row ratio
+before seeding the actual 28.4M-row table above; it has since been dropped and was never part of
+the results in this file.
 
 ## Honest notes
 
