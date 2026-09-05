@@ -1,6 +1,6 @@
 from tributary.planner import plan, classify, is_binary_coercible, preflight_sql
 from tributary.model import (Safety, TableStats, AddColumn, DropColumn, RenameColumn,
-                             AlterColumnType, SetNotNull, AddConstraint, CreateIndex,
+                             AlterColumnType, SetNotNull, SetDefault, AddConstraint, CreateIndex,
                              Column, Constraint, Index, CreateTable, Table, DropTable,
                              DropIndex)
 
@@ -163,6 +163,128 @@ def test_never_analysed_large_table_still_takes_the_safe_path():
     p = plan([c], never_analysed_big, "main", pk_columns={"events": "id"})
     kinds = [s.kind for s in p.steps]
     assert "backfill" in kinds and "swap" in kinds
+
+
+# --- CRITICAL fix round 1: volatile ADD COLUMN defaults are not metadata-only
+
+def test_volatile_defaults_are_not_metadata_only_on_a_large_table():
+    # PG11+'s fast ADD COLUMN path only skips the rewrite for a *constant*
+    # default; a volatile one (any function call) forces Postgres to
+    # compute and write a real value into every existing row immediately --
+    # a full table rewrite under ACCESS EXCLUSIVE. Deliberately no allowlist
+    # of "known volatile" function names here (see _is_constant_default's
+    # docstring) -- these three are just representative examples, not the
+    # full set the fix is supposed to catch.
+    for default in ["gen_random_uuid()", "nextval('events_id_seq'::regclass)", "random()"]:
+        c = AddColumn("events", Column("x", "uuid", False, default, 9))
+        assert classify(c, BIG["events"]) != Safety.SAFE_METADATA, default
+
+
+def test_literal_defaults_stay_metadata_only():
+    cases = [
+        Column("tier", "int4", False, "0", 9),
+        Column("code", "text", False, "'x'", 9),
+        Column("flag", "bool", False, "TRUE", 9),
+        Column("label", "text", False, "'x'::text", 9),
+    ]
+    for column in cases:
+        c = AddColumn("events", column)
+        assert classify(c, BIG["events"]) == Safety.SAFE_METADATA, column.default
+
+
+def test_volatile_default_on_a_large_table_produces_a_warning():
+    c = AddColumn("events", Column("id2", "uuid", False, "gen_random_uuid()", 9))
+    p = plan([c], BIG, "main")
+    assert p.warnings
+    joined = " ".join(p.warnings).lower()
+    assert "events" in joined
+
+
+def test_volatile_default_on_a_small_table_emits_no_warning():
+    # The classification (rewrite-equivalent) doesn't depend on size, but
+    # the *warning* -- like every other size-triggered warning in this
+    # module -- only fires when the table is actually large enough to
+    # matter; a handful of rows costs nothing to rewrite.
+    small = {"events": TableStats(rows=200, bytes=16_384)}
+    c = AddColumn("events", Column("id2", "uuid", False, "gen_random_uuid()", 9))
+    p = plan([c], small, "main")
+    assert p.warnings == []
+
+
+# --- IMPORTANT fix round 1: don't double-restore NOT NULL/DEFAULT -----------
+
+def test_combined_retype_and_nullability_and_default_change_dedupes_the_restoration():
+    """A single commit that retypes a column *and* separately changes its
+    nullability and default emits AlterColumnType (carrying the target
+    nullable/default, R20) *and* standalone SetNotNull/SetDefault changes
+    for that same column -- diff.py reports both, honestly. On a large
+    table with a known PK, the shadow dance already restores NOT NULL
+    (validated on the shadow column before the swap) and DEFAULT (set
+    directly in the swap); the separately-emitted SetNotNull/SetDefault
+    must not repeat that as a second, fully redundant NOT VALID/VALIDATE/
+    SET NOT NULL/DROP sequence -- that VALIDATE is a real full-table scan
+    proving something already proven.
+    """
+    changes = [
+        AlterColumnType("events", "id", "int4", "int8", nullable=False, default="0"),
+        SetNotNull("events", "id"),
+        SetDefault("events", "id", "0"),
+    ]
+    p = plan(changes, BIG, "main", pk_columns={"events": "id"})
+
+    kinds = [s.kind for s in p.steps]
+    assert "backfill" in kinds and "swap" in kinds
+
+    # Exactly two VALIDATE CONSTRAINT steps: the shadow dance's own
+    # backfill-verification count-check and its NOT NULL scaffold
+    # validation. A third (from a non-deduped standalone SetNotNull) would
+    # be the redundant full-table scan this fix removes.
+    validate_steps = [s for s in p.steps if s.kind == "validate"]
+    assert len(validate_steps) == 2
+
+    set_default_occurrences = [s for s in sqls(p) if "SET DEFAULT" in s]
+    assert len(set_default_occurrences) == 1
+
+
+def test_no_pk_fallback_still_needs_the_separate_not_null_restoration():
+    # With no known PK, the retype falls back to a plain ALTER, which never
+    # touches nullability/default at all -- so here the standalone
+    # SetNotNull is NOT redundant and must still run in full.
+    changes = [
+        AlterColumnType("events", "id", "int4", "int8", nullable=False, default="0"),
+        SetNotNull("events", "id"),
+    ]
+    p = plan(changes, BIG, "main")  # no pk_columns -> conservative fallback
+    validate_steps = [s for s in p.steps if s.kind == "validate"]
+    assert len(validate_steps) == 1  # SetNotNull's own VALIDATE CONSTRAINT
+
+
+def test_small_table_retype_still_needs_the_separate_not_null_restoration():
+    # The small-table (LOCK_BRIEF) path is a plain ALTER too -- it never
+    # restores nullability/default either, so the standalone SetNotNull
+    # must not be deduped here.
+    small = {"events": TableStats(rows=200, bytes=16_384)}
+    changes = [
+        AlterColumnType("events", "id", "int4", "int8", nullable=False, default="0"),
+        SetNotNull("events", "id"),
+    ]
+    p = plan(changes, small, "main", pk_columns={"events": "id"})
+    validate_steps = [s for s in p.steps if s.kind == "validate"]
+    assert len(validate_steps) == 1
+
+
+def test_unrelated_columns_are_never_deduped_against_each_other():
+    # A SetNotNull on a *different* column than the one being retyped must
+    # never be swallowed by the dedup -- it only matches on (table, column).
+    changes = [
+        AlterColumnType("events", "id", "int4", "int8", nullable=False, default="0"),
+        SetNotNull("events", "other_col"),
+    ]
+    p = plan(changes, BIG, "main", pk_columns={"events": "id"})
+    validate_steps = [s for s in p.steps if s.kind == "validate"]
+    # 2 from the shadow dance (verify + NOT NULL scaffold) + 1 from
+    # other_col's own, unrelated SetNotNull.
+    assert len(validate_steps) == 3
 
 
 # --- R19: eliminate the {pk} placeholder entirely ---------------------------

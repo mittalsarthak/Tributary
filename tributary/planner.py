@@ -252,6 +252,42 @@ def is_binary_coercible(old: str, new: str) -> bool:
     return False
 
 
+# --- constant-default detection (R22 fix round 1, CRITICAL) ------------------
+
+_NUMBER_RE = re.compile(r"^[+-]?\d+(\.\d+)?$")
+_STRING_RE = re.compile(r"^'(?:[^']|'')*'$")
+_KEYWORD_LITERALS = {"true", "false", "null"}
+_CAST_RE = re.compile(r"^(?P<val>.*?)::(?P<cast>[a-zA-Z_][a-zA-Z0-9_ ]*(\([^)]*\))?)$")
+
+
+def _is_constant_default(default: str) -> bool:
+    """Is `default` demonstrably a literal -- a number, a quoted string,
+    `TRUE`/`FALSE`/`NULL`, or a cast of one of those -- rather than a
+    function call?
+
+    This is the one place in the module that must fail *closed*: PG11+'s
+    fast `ADD COLUMN ... DEFAULT` path is metadata-only only for a
+    non-volatile default. `gen_random_uuid()`, `nextval(...)`, `now()`,
+    `random()` and any other function call all force Postgres to compute
+    and write an actual value into every existing row immediately -- a full
+    table rewrite under `ACCESS EXCLUSIVE`, exactly what this project
+    exists to prevent, dressed up as a plan step that would otherwise claim
+    `SAFE_METADATA`. Deliberately no allowlist of "known volatile" function
+    names: an allowlist fails open on every function whoever wrote it did
+    not think of, and this is precisely the place where the failure mode
+    of guessing wrong is an outage, not an unnecessary warning.
+    """
+    s = default.strip()
+    m = _CAST_RE.match(s)
+    if m:
+        s = m.group("val").strip()
+    if _NUMBER_RE.match(s):
+        return True
+    if _STRING_RE.match(s):
+        return True
+    return s.lower() in _KEYWORD_LITERALS
+
+
 # --- classification ------------------------------------------------------------
 
 def classify(change: Change, stats: TableStats | None) -> Safety:
@@ -265,15 +301,23 @@ def classify(change: Change, stats: TableStats | None) -> Safety:
             return Safety.SAFE_METADATA
 
         case AddColumn(column=column):
-            if column.nullable or column.default is not None:
-                # PG11+: ADD COLUMN with a constant default (or nullable, no
-                # default) never rewrites the table -- the default is
-                # applied lazily, and a nullable column with no default
-                # needs no per-row value at all.
+            if column.default is None:
+                # Nullable with no default needs no per-row value at all.
+                # NOT NULL with no default: Postgres cannot invent a value
+                # for existing rows, so this cannot be metadata-only.
+                return Safety.SAFE_METADATA if column.nullable else Safety.LOCK_HEAVY
+            if _is_constant_default(column.default):
+                # PG11+: ADD COLUMN with a *constant* default is
+                # metadata-only -- Postgres stores the default once and
+                # applies it lazily to old rows on read.
                 return Safety.SAFE_METADATA
-            # NOT NULL with no default: Postgres cannot invent a value for
-            # existing rows, so this cannot be metadata-only.
-            return Safety.LOCK_HEAVY
+            # A volatile default (any function call: gen_random_uuid(),
+            # nextval(...), now(), random(), ...) cannot use that fast
+            # path -- Postgres must compute and write the actual value for
+            # every existing row immediately, a full table rewrite under
+            # ACCESS EXCLUSIVE, regardless of whether the column is
+            # nullable.
+            return Safety.REWRITE
 
         case (DropColumn() | RenameColumn() | DropNotNull() | SetDefault()
               | DropDefault() | DropConstraint() | DropIndex()):
@@ -424,6 +468,16 @@ def _warn_rewrite(table: str, st: TableStats | None) -> str:
     )
 
 
+def _warn_volatile_default(table: str, column: str, st: TableStats | None) -> str:
+    return (
+        f"{table} is {_size_desc(st)} -- adding {column!r} with a volatile default forces "
+        f"Postgres to compute and write a value for every existing row immediately, a full "
+        f"table rewrite under ACCESS EXCLUSIVE just like a naive retype, not the PG11+ "
+        f"metadata-only fast path. Consider adding the column nullable with no default, "
+        f"backfilling the value yourself, then setting the default afterwards."
+    )
+
+
 def _warn_no_pk_fallback(table: str, st: TableStats | None) -> str:
     return (
         f"{table} ({_size_desc(st)}) has no primary key Tributary can use for a safe "
@@ -455,8 +509,8 @@ def _not_null_steps(table: str, column: str, schema: str, lock_timeout: str,
     qualified = _qualified(schema, table)
     col = _ident(column)
     scaffold = _ident(f"{column}_trib_notnull")
-    est_rows = st.rows if st else None
-    est_bytes = st.bytes if st else None
+    est_rows = st.rows if st is not None else None
+    est_bytes = st.bytes if st is not None else None
     probe = f"SELECT count(*) FROM {qualified} WHERE {col} IS NULL"
     return [
         _S(probe, "preflight", Safety.LOCK_HEAVY, True,
@@ -493,8 +547,8 @@ def _emit_add_constraint(change: AddConstraint, schema: str, lock_timeout: str,
     table = change.table
     qualified = _qualified(schema, table)
     name_ident = _ident(con.name)
-    est_rows = st.rows if st else None
-    est_bytes = st.bytes if st else None
+    est_rows = st.rows if st is not None else None
+    est_bytes = st.bytes if st is not None else None
 
     if con.kind in ("c", "f"):
         not_valid = f"ALTER TABLE {qualified} ADD CONSTRAINT {name_ident} {con.definition} NOT VALID"
@@ -565,8 +619,8 @@ def _emit_create_index(change: CreateIndex, schema: str, lock_timeout: str,
     table = change.table
     definition = change.index.definition
     concurrent = _CIC_RE.sub(lambda m: m.group(1) + "CONCURRENTLY ", definition, count=1)
-    est_rows = st.rows if st else None
-    est_bytes = st.bytes if st else None
+    est_rows = st.rows if st is not None else None
+    est_bytes = st.bytes if st is not None else None
 
     return [
         _lock_timeout_step(lock_timeout, table, est_rows, est_bytes,
@@ -589,8 +643,8 @@ def _emit_retype_no_pk_fallback(change: AlterColumnType, schema: str, lock_timeo
     path was unavailable so a human sees the tradeoff up front.
     """
     table = change.table
-    est_rows = st.rows if st else None
-    est_bytes = st.bytes if st else None
+    est_rows = st.rows if st is not None else None
+    est_bytes = st.bytes if st is not None else None
     steps: list[_S] = []
 
     probe = preflight_sql(change, schema)
@@ -620,8 +674,8 @@ def _shadow_dance(change: AlterColumnType, schema: str, lock_timeout: str,
     func_ident = _qualified(schema, f"{table}_{column}_trib_sync")
     trig_ident = _ident(f"{table}_{column}_trib_sync_trg")
     pk_ident = _ident(pk_col)
-    est_rows = st.rows if st else None
-    est_bytes = st.bytes if st else None
+    est_rows = st.rows if st is not None else None
+    est_bytes = st.bytes if st is not None else None
 
     steps: list[_S] = []
 
@@ -732,8 +786,8 @@ def _emit_alter_column_type(change: AlterColumnType, schema: str, lock_timeout: 
                              batch_size: int, safety: Safety, st: TableStats | None,
                              pk_col: str | None) -> tuple[list[_S], list[str]]:
     table = change.table
-    est_rows = st.rows if st else None
-    est_bytes = st.bytes if st else None
+    est_rows = st.rows if st is not None else None
+    est_bytes = st.bytes if st is not None else None
 
     if safety in (Safety.SAFE_METADATA, Safety.LOCK_BRIEF):
         steps: list[_S] = []
@@ -761,8 +815,8 @@ def _emit_alter_column_type(change: AlterColumnType, schema: str, lock_timeout: 
 def _emit(change: Change, schema: str, lock_timeout: str, batch_size: int,
           safety: Safety, st: TableStats | None, pk_col: str | None) -> tuple[list[_S], list[str]]:
     table = _table_name(change)
-    est_rows = st.rows if st else None
-    est_bytes = st.bytes if st else None
+    est_rows = st.rows if st is not None else None
+    est_bytes = st.bytes if st is not None else None
 
     match change:
         case CreateTable() | DropTable() | RenameTable():
@@ -770,9 +824,20 @@ def _emit(change: Change, schema: str, lock_timeout: str, batch_size: int,
                                 est_rows, est_bytes, "metadata-only catalog change"), []
 
         case AddColumn():
-            note = ("nullable or has a constant default -- PG11+ makes this metadata only"
-                    if safety == Safety.SAFE_METADATA else
-                    "NOT NULL with no default cannot be added metadata-only; Postgres must "
+            if safety == Safety.SAFE_METADATA:
+                note = "nullable or has a constant default -- PG11+ makes this metadata only"
+                return _emit_plain(change, schema, lock_timeout, safety, table,
+                                    est_rows, est_bytes, note), []
+            if safety == Safety.REWRITE:
+                note = ("volatile default forces Postgres to compute and write a value for "
+                        "every existing row immediately -- a full table rewrite under "
+                        "ACCESS EXCLUSIVE, not the PG11+ metadata-only fast path")
+                steps = _emit_plain(change, schema, lock_timeout, safety, table,
+                                     est_rows, est_bytes, note)
+                warnings = [_warn_volatile_default(table, change.column.name, st)] \
+                    if _is_large(st) else []
+                return steps, warnings
+            note = ("NOT NULL with no default cannot be added metadata-only; Postgres must "
                     "validate/backfill a value for every existing row")
             return _emit_plain(change, schema, lock_timeout, safety, table,
                                 est_rows, est_bytes, note), []
@@ -799,6 +864,24 @@ def _emit(change: Change, schema: str, lock_timeout: str, batch_size: int,
             raise TypeError(f"planner: no rewrite for change type {type(change).__name__!r}")
 
 
+def _will_shadow_dance_restore(change: AlterColumnType, stats: dict[str, TableStats],
+                                pk_columns: dict[str, str] | None) -> bool:
+    """Predicts whether `change` will actually route through `_shadow_dance`
+    (as opposed to a plain `ALTER` on the coercible, small-table, or
+    no-known-PK paths) -- the *only* path that restores `nullable`/
+    `default` at all. Used by `plan()`'s pre-pass (R20 dedup fix, IMPORTANT
+    round-1 fix) to find every column a separately-emitted `SetNotNull`/
+    `SetDefault` would be redundant against, before any change is emitted --
+    so the dedup holds regardless of the two changes' relative order in the
+    input list, not just diff.py's own conventional ordering.
+    """
+    st = stats.get(change.table) if change.table is not None else None
+    if classify(change, st) != Safety.REWRITE:
+        return False
+    pk_col = pk_columns.get(change.table) if (pk_columns and change.table is not None) else None
+    return pk_col is not None
+
+
 # --- public entry point --------------------------------------------------------
 
 def plan(changes: list[Change], stats: dict[str, TableStats], schema: str, *,
@@ -816,13 +899,44 @@ def plan(changes: list[Change], stats: dict[str, TableStats], schema: str, *,
     this map (or `pk_columns` not supplied at all) that needs a rewriting
     retype on a large table cannot be safely batch-backfilled by PK range --
     see `_emit_retype_no_pk_fallback` and the module docstring.
+
+    R20 dedup (IMPORTANT round-1 fix): when one commit both retypes a column
+    and separately changes its nullability/default, `diff.py` emits *both*
+    an `AlterColumnType` (carrying the target `nullable`/`default`) *and* a
+    standalone `SetNotNull`/`SetDefault` for the same column. If the retype
+    takes the real shadow-column path, its swap already restores
+    `nullable`/`default` -- the standalone change would then repeat that
+    work with a second, fully redundant `NOT VALID`/`VALIDATE`/
+    `SET NOT NULL`/`DROP` sequence (a genuine full-table scan under
+    `VALIDATE`, proving something already proven) or a redundant
+    `SET DEFAULT`. `diff.py` keeps reporting what actually changed --
+    deduplicating the *work* is this module's job, not diff's, so the
+    dedup lives here: a pre-pass finds every (table, column) the shadow
+    dance will actually restore, and the standalone change is dropped from
+    the plan for exactly those.
     """
+    restored_not_null: set[tuple[str, str]] = set()
+    restored_default: set[tuple[str, str]] = set()
+    for change in changes:
+        if isinstance(change, AlterColumnType) and _will_shadow_dance_restore(
+                change, stats, pk_columns):
+            if change.nullable is False:
+                restored_not_null.add((change.table, change.column))
+            if change.default is not None:
+                restored_default.add((change.table, change.column))
+
     ordered = _order(changes)
     intermediate: list[_S] = []
     warnings: list[str] = []
 
     for change in ordered:
         table = _table_name(change)
+
+        if isinstance(change, SetNotNull) and (table, change.column) in restored_not_null:
+            continue  # already restored by this column's own retype -- see docstring
+        if isinstance(change, SetDefault) and (table, change.column) in restored_default:
+            continue
+
         st = stats.get(table) if table is not None else None
         safety = classify(change, st)
         pk_col = pk_columns.get(table) if (pk_columns and table is not None) else None
