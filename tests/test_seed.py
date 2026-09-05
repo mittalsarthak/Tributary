@@ -1,7 +1,16 @@
 import pytest
+from psycopg import sql
 
 from tributary import seed, store
 from tributary.introspect import snapshot, table_stats
+
+
+def _q(table: str) -> str:
+    """Quote a `main.<table>` reference the same way `seed.py` does --
+    through `sql.Identifier`, never a raw f-string -- even where `table`
+    is a hardcoded loop variable rather than external input.
+    """
+    return sql.Identifier("main", table).as_string(None)
 
 
 @pytest.fixture(autouse=True)
@@ -59,14 +68,14 @@ def test_ensure_demo_second_call_does_not_duplicate_rows(conn):
     store.init(conn)
     seed.ensure_demo(conn)
     counts_before = {
-        t: conn.execute(f"SELECT count(*) FROM main.{t}").fetchone()[0]
+        t: conn.execute(f"SELECT count(*) FROM {_q(t)}").fetchone()[0]
         for t in ("users", "orders", "events")
     }
 
     seed.ensure_demo(conn)
 
     counts_after = {
-        t: conn.execute(f"SELECT count(*) FROM main.{t}").fetchone()[0]
+        t: conn.execute(f"SELECT count(*) FROM {_q(t)}").fetchone()[0]
         for t in ("users", "orders", "events")
     }
     assert counts_after == counts_before
@@ -142,7 +151,7 @@ def test_ensure_demo_seeds_roughly_10k_rows(conn):
     store.init(conn)
     seed.ensure_demo(conn)
     total = sum(
-        conn.execute(f"SELECT count(*) FROM main.{t}").fetchone()[0]
+        conn.execute(f"SELECT count(*) FROM {_q(t)}").fetchone()[0]
         for t in ("users", "orders", "events")
     )
     assert 5000 <= total <= 20000
@@ -181,6 +190,27 @@ def test_grow_events_is_a_noop_when_already_at_target(conn, monkeypatch):
 
     after = conn.execute("SELECT count(*) FROM main.events").fetchone()[0]
     assert after == before
+    assert calls == []
+
+
+def test_grow_events_is_a_noop_when_target_is_below_current_count(conn, monkeypatch):
+    """The below-target case, not just the exact-equal boundary.
+
+    `target == before` passes even with a `!=` guard or a sign error; only a
+    target strictly below the current count catches arithmetic that would
+    compute a negative batch and either loop forever or delete rows.
+    """
+    store.init(conn)
+    seed.ensure_demo(conn)
+    before = conn.execute("SELECT count(*) FROM main.events").fetchone()[0]
+    assert before > 10, "demo seed should leave enough rows to undershoot"
+
+    calls = []
+    monkeypatch.setattr(seed, "_BATCH_SIZE", 10)
+    seed.grow_events(conn, before - 10, on_progress=lambda done, target: calls.append(done))
+
+    after = conn.execute("SELECT count(*) FROM main.events").fetchone()[0]
+    assert after == before, "growing to a smaller target must never remove rows"
     assert calls == []
 
 
