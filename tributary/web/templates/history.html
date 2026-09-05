@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-1">History: {{ branch.name }}</h1>
+<p class="text-slate-500 text-sm mb-4"><a href="/branches/{{ branch.name }}" class="hover:underline">&larr; back to editor</a></p>
+
+<ul class="divide-y divide-slate-200">
+  {% for c in commits %}
+  <li class="py-2">
+    <div class="font-mono text-xs text-slate-500">{{ c.id[:8] }}</div>
+    <div>{{ c.message }}</div>
+    <div class="text-xs text-slate-500">{{ c.author }} &middot; {{ c.created_at }}</div>
+  </li>
+  {% else %}
+  <li class="py-4 text-slate-500 text-sm">No commits yet.</li>
+  {% endfor %}
+</ul>
+{% endblock %}

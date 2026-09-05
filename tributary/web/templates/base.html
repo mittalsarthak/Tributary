@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tributary</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.12/dist/htmx.min.js"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+<nav class="bg-slate-900 text-white px-6 py-3 flex items-baseline gap-4">
+  <a href="/" class="font-semibold text-lg">Tributary</a>
+  <span class="text-slate-400 text-sm">branch / diff / merge for Postgres schemas</span>
+</nav>
+<main class="max-w-5xl mx-auto p-6">
+{% block content %}{{ body|safe if body else "" }}{% endblock %}
+</main>
+</body>
+</html>
+
+{% macro safety_badge(safety) -%}
+{% set cls = {
+  "safe_metadata": "bg-green-100 text-green-800 border-green-300",
+  "lock_brief": "bg-yellow-100 text-yellow-800 border-yellow-300",
+  "lock_heavy": "bg-orange-100 text-orange-800 border-orange-300",
+  "rewrite": "bg-red-100 text-red-800 border-red-300",
+}.get(safety, "bg-gray-100 text-gray-800 border-gray-300") %}
+<span class="inline-block px-2 py-0.5 rounded border text-xs font-mono {{ cls }}">{{ safety }}</span>
+{%- endmacro %}
+
+{% macro plan_report(plan) -%}
+<div class="space-y-3">
+  {% if plan.warnings %}
+  <div class="space-y-2">
+    {% for w in plan.warnings %}
+    <div class="rounded border border-amber-400 bg-amber-50 text-amber-900 px-3 py-2 text-sm">
+      <span aria-hidden="true">&#9888;</span> {{ w }}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% if plan.steps %}
+  <div class="overflow-x-auto">
+  <table class="w-full text-sm border-collapse">
+    <thead>
+      <tr class="text-left border-b border-slate-300">
+        <th class="py-1 pr-3">#</th>
+        <th class="py-1 pr-3">safety</th>
+        <th class="py-1 pr-3">table</th>
+        <th class="py-1 pr-3">what</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for step in plan.steps %}
+      <tr class="border-b border-slate-100 align-top">
+        <td class="py-1 pr-3 text-slate-500">{{ step.seq }}</td>
+        <td class="py-1 pr-3">{{ safety_badge(step.safety) }}</td>
+        <td class="py-1 pr-3 font-mono">{{ step.table or "-" }}</td>
+        <td class="py-1 pr-3">{{ step.note }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="text-slate-500 text-sm">No steps -- nothing to change.</p>
+  {% endif %}
+</div>
+{%- endmacro %}

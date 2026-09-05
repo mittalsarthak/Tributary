@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="flex items-center justify-between mb-1">
+  <h1 class="text-xl font-semibold">
+    {{ branch.name }}
+    <span class="text-slate-400 font-mono text-sm ml-2">{{ branch.schema_name }}</span>
+  </h1>
+  <div class="flex gap-4 text-sm">
+    <a href="/branches/{{ branch.name }}/history" class="text-blue-700 hover:underline">history</a>
+    <a href="/branches/{{ branch.name }}/diff?target=main" class="text-blue-700 hover:underline">diff vs main</a>
+  </div>
+</div>
+<p class="text-slate-500 text-sm mb-4"><a href="/" class="hover:underline">&larr; all branches</a></p>
+
+{% if error %}
+<div class="rounded border border-red-300 bg-red-50 text-red-800 px-4 py-3 mb-4">{{ error }}</div>
+{% endif %}
+
+{% if pending %}
+<div class="rounded border border-amber-300 bg-amber-50 text-amber-900 px-4 py-3 mb-4 text-sm">
+  {{ pending|length }} uncommitted change{{ "s" if pending|length != 1 else "" }} on this branch,
+  not yet committed.
+</div>
+{% endif %}
+
+<div class="space-y-4 mb-6">
+  {% for tname, table in tables.items() %}
+  <div class="rounded border border-slate-200">
+    <div class="bg-slate-100 px-3 py-2 font-mono font-semibold">{{ tname }}</div>
+    <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <tbody>
+        {% for cname, col in table.columns.items() %}
+        <tr class="border-t border-slate-100">
+          <td class="px-3 py-1 font-mono">{{ cname }}</td>
+          <td class="px-3 py-1 font-mono text-slate-500">{{ col.type }}</td>
+          <td class="px-3 py-1 text-slate-500">{{ "NOT NULL" if not col.nullable else "" }}</td>
+          <td class="px-3 py-1 text-slate-500">{{ col.default or "" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+  {% else %}
+  <p class="text-slate-500 text-sm">No tables in this branch yet.</p>
+  {% endfor %}
+</div>
+
+<h2 class="font-semibold mb-2">Add a column</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="add_column">
+  <div><label class="block text-xs text-slate-500">table</label>
+    <select name="table" class="border rounded px-2 py-1">
+      {% for tname in tables.keys() %}<option value="{{ tname }}">{{ tname }}</option>{% endfor %}
+    </select>
+  </div>
+  <div><label class="block text-xs text-slate-500">column name</label>
+    <input name="name" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">type</label>
+    <input name="type" value="text" class="border rounded px-2 py-1" required></div>
+  <label class="flex items-center gap-1 pb-1.5"><input type="checkbox" name="not_null"> NOT NULL</label>
+  <div><label class="block text-xs text-slate-500">default</label>
+    <input name="default" class="border rounded px-2 py-1"></div>
+  <button type="submit" class="bg-slate-900 text-white px-3 py-1.5 rounded">Add column</button>
+</form>
+
+<h2 class="font-semibold mb-2">Drop a column</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="drop_column">
+  <div><label class="block text-xs text-slate-500">table</label>
+    <input name="table" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">column</label>
+    <input name="column" class="border rounded px-2 py-1" required></div>
+  <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Drop column</button>
+</form>
+
+<h2 class="font-semibold mb-2">Rename a column</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="rename_column">
+  <div><label class="block text-xs text-slate-500">table</label>
+    <input name="table" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">old name</label>
+    <input name="old" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">new name</label>
+    <input name="new" class="border rounded px-2 py-1" required></div>
+  <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Rename column</button>
+</form>
+
+<hr class="my-6 border-slate-200">
+
+<h2 class="font-semibold mb-2">Commit</h2>
+<form hx-post="/branches/{{ branch.name }}/commit" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/commit" class="flex gap-2 items-end text-sm">
+  <div class="flex-1"><label class="block text-xs text-slate-500">message</label>
+    <input name="message" class="border rounded px-2 py-1 w-full" value="edit" required></div>
+  <button type="submit" class="bg-emerald-700 text-white px-3 py-1.5 rounded">Commit</button>
+</form>
+{% endblock %}

@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-1">Branches</h1>
+<p class="text-slate-500 text-sm mb-4">
+  A branch is an instant, structure-only copy of a schema you can experiment on safely --
+  nothing you do on it touches the original until you merge it back.
+</p>
+
+{% if error %}
+<div class="rounded border border-red-300 bg-red-50 text-red-800 px-4 py-3 mb-4">{{ error }}</div>
+{% endif %}
+
+<form hx-post="/branches" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches" class="flex flex-wrap gap-2 items-end mb-6">
+  <div>
+    <label class="block text-xs text-slate-500">new branch name</label>
+    <input name="name" required class="border rounded px-2 py-1">
+  </div>
+  <div>
+    <label class="block text-xs text-slate-500">from</label>
+    <select name="from_branch" class="border rounded px-2 py-1">
+      {% for row in rows %}<option value="{{ row.b.name }}">{{ row.b.name }}</option>{% endfor %}
+    </select>
+  </div>
+  <button type="submit" class="bg-slate-900 text-white px-3 py-1.5 rounded">Create branch</button>
+</form>
+
+<div id="branch-list">
+{% if not has_feature_branches %}
+<div class="rounded border border-blue-300 bg-blue-50 text-blue-900 px-4 py-3 mb-4">
+  You have one branch so far: <span class="font-mono">main</span>. Create your first branch above
+  to start experimenting with schema changes.
+</div>
+{% endif %}
+
+<div class="overflow-x-auto">
+<table class="w-full text-sm border-collapse">
+  <thead>
+    <tr class="text-left border-b border-slate-300">
+      <th class="py-1 pr-3">branch</th>
+      <th class="py-1 pr-3">ahead</th>
+      <th class="py-1 pr-3">behind</th>
+      <th class="py-1 pr-3"></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr class="border-b border-slate-100">
+      <td class="py-1 pr-3">
+        <a href="/branches/{{ row.b.name }}" class="font-mono text-blue-700 hover:underline">{{ row.b.name }}</a>
+      </td>
+      <td class="py-1 pr-3">{{ row.ahead }}</td>
+      <td class="py-1 pr-3">{{ row.behind }}</td>
+      <td class="py-1 pr-3 text-right whitespace-nowrap">
+        {% if row.b.name != "main" %}
+        <a href="/branches/{{ row.b.name }}/diff?target=main" class="text-slate-500 hover:underline text-xs mr-3">diff</a>
+        <a href="/branches/{{ row.b.name }}/history" class="text-slate-500 hover:underline text-xs mr-3">history</a>
+        <button hx-delete="/branches/{{ row.b.name }}" hx-target="body" hx-select="body" hx-swap="outerHTML"
+                hx-confirm="Delete branch '{{ row.b.name }}' and its schema?"
+                class="text-red-700 hover:underline text-xs">delete</button>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+</div>
+
+<hr class="my-6 border-slate-200">
+
+<h2 class="font-semibold mb-2">Grow the demo <span class="font-mono">events</span> table</h2>
+<p class="text-slate-500 text-sm mb-2">
+  Current size:
+  <strong>{{ "%.2f"|format((events.bytes / (1024**3)) if events else 0) }} GB</strong>,
+  {% if events and events.rows is not none %}{{ "{:,}".format(events.rows) }} rows{% else %}an unknown number of rows (never analysed){% endif %}.
+  Grow it and watch a retype/index build on this table move from "instant, metadata only"
+  to a rewrite warning in the diff/merge safety report.
+</p>
+<form hx-post="/seed/grow" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/seed/grow" class="flex flex-wrap gap-2 text-sm">
+  <button type="submit" name="target_rows" value="1000000" class="border rounded px-3 py-1.5 hover:bg-slate-100">Grow to 1M rows</button>
+  <button type="submit" name="target_rows" value="10000000" class="border rounded px-3 py-1.5 hover:bg-slate-100">Grow to 10M rows</button>
+  <button type="submit" name="target_rows" value="50000000" class="border rounded px-3 py-1.5 hover:bg-slate-100">Grow to 50M rows</button>
+</form>
+{% if grow_running %}
+<p class="text-amber-700 text-sm mt-2"
+   hx-get="/" hx-trigger="every 2s" hx-select="main" hx-target="main" hx-swap="innerHTML">
+  Growing now: {{ "{:,}".format(grow_done) }} / {{ "{:,}".format(grow_target) }} rows so far&hellip;
+  (this refreshes itself every couple of seconds until the growth finishes)
+</p>
+{% endif %}
+{% endblock %}

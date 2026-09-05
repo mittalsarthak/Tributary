@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% import "base.html" as ui %}
+{% block content %}
+<div data-merge-id="{{ merge.id }}" data-merge-status="{{ merge.status }}">
+  <h1 class="text-xl font-semibold mb-1">Merge {{ merge.source }} &rarr; {{ merge.target }}</h1>
+  <p class="text-slate-500 text-sm mb-4"><a href="/" class="hover:underline">&larr; back to branches</a></p>
+
+  {% if error %}
+  <div class="rounded border border-red-300 bg-red-50 text-red-800 px-4 py-3 mb-4">{{ error }}</div>
+  {% endif %}
+
+  {% if conflicts %}
+  <div class="rounded border border-red-300 bg-red-50 text-red-800 px-4 py-3 mb-4">
+    {{ conflicts|length }} conflict{{ "s" if conflicts|length != 1 else "" }} must be resolved
+    before this merge can run -- both sides changed the same thing and Tributary will not
+    silently pick one for you.
+  </div>
+  <form hx-post="/merges/{{ merge.id }}/resolve" hx-target="[data-merge-id]" hx-select="[data-merge-id]"
+        hx-swap="outerHTML" method="post" action="/merges/{{ merge.id }}/resolve">
+    {% for c in conflicts %}
+    <fieldset class="rounded border border-slate-300 p-3 mb-3">
+      <legend class="text-sm font-mono px-1">{{ c.kind }} at {{ c.path }}</legend>
+      <input type="hidden" name="path" value="{{ c.path }}">
+      <label class="block text-sm py-0.5">
+        <input type="radio" name="side" value="ours" required>
+        keep {{ merge.target }}: <span class="font-mono">{{ c.ours }}</span>
+      </label>
+      <label class="block text-sm py-0.5">
+        <input type="radio" name="side" value="theirs">
+        take {{ merge.source }}: <span class="font-mono">{{ c.theirs }}</span>
+      </label>
+    </fieldset>
+    {% endfor %}
+    <button type="submit" class="bg-slate-900 text-white px-4 py-2 rounded">Resolve conflicts</button>
+  </form>
+
+  {% else %}
+  <h2 class="font-semibold mb-2">Safety report</h2>
+  {{ ui.plan_report(plan) }}
+
+  {% if can_run %}
+  <form hx-post="/merges/{{ merge.id }}/run" hx-target="[data-merge-id]" hx-select="[data-merge-id]"
+        hx-swap="outerHTML" method="post" action="/merges/{{ merge.id }}/run" class="mt-4">
+    <button id="run-merge-btn" type="submit" class="bg-red-700 text-white px-4 py-2 rounded">
+      Run this merge
+    </button>
+  </form>
+  {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

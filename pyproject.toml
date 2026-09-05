@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3", "testcontainers[postgres]>=4.8"]
+dev = ["pytest>=8.3", "testcontainers[postgres]>=4.8", "httpx>=0.27"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

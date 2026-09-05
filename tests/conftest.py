@@ -34,6 +34,53 @@ def fresh_schema(conn):
     conn.execute(f'DROP SCHEMA "{name}" CASCADE')
 
 
+def _drop_tributary_schemas(conn) -> None:
+    """Drop every Tributary-managed schema: `main`, `_tributary`, and any
+    `br_*` branch schema. Shared by the `client` fixture below (setup *and*
+    teardown, so a test's own failure never leaks branches into the next
+    one) -- same pattern `ws`'s teardown (above) and `test_seed.py`'s
+    autouse fixture already use.
+    """
+    conn.execute("DROP SCHEMA IF EXISTS main CASCADE")
+    conn.execute("DROP SCHEMA IF EXISTS _tributary CASCADE")
+    for (s,) in conn.execute("SELECT nspname FROM pg_namespace "
+                              "WHERE nspname LIKE 'br\\_%'").fetchall():
+        conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(s)))
+
+
+@pytest.fixture
+def client(conn, pg_dsn, monkeypatch):
+    """A FastAPI `TestClient` wired to the test Postgres container, with a
+    freshly seeded demo workspace (Task 11, ruling R7).
+
+    `DATABASE_URL`/`TRIBUTARY_AUTOSEED=1` are set *before* the app's ASGI
+    lifespan starts, so `with TestClient(app) as c:` -- which runs the
+    app's real startup handler -- both points `tributary.db.dsn()` at this
+    test's database and doubles as a live regression test of the
+    `TRIBUTARY_AUTOSEED` startup wiring itself: if that wiring silently
+    stopped calling `store.init`/`seed.ensure_demo`, every test using this
+    fixture would fail immediately (no `main` branch to find).
+
+    Every Tributary-managed schema is dropped before *and* after, so each
+    test starts from a clean slate regardless of what a previous test
+    created (branches, merges, ...) -- required because `tributary.web.app`
+    holds its uncommitted-edit/merge state in module-level dicts that are
+    only reset by the app's own startup handler, which runs fresh on every
+    `with TestClient(app)` block here.
+    """
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    monkeypatch.setenv("TRIBUTARY_AUTOSEED", "1")
+    _drop_tributary_schemas(conn)
+
+    from fastapi.testclient import TestClient
+    from tributary.web.app import app
+
+    with TestClient(app) as test_client:
+        yield test_client
+
+    _drop_tributary_schemas(conn)
+
+
 @pytest.fixture
 def ws(conn):
     """A `conn` with `_tributary` initialised and `main` adopted, carrying one

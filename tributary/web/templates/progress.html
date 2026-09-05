@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+<div data-merge-id="{{ merge.id }}" data-merge-status="{{ merge.status }}">
+  <h1 class="text-xl font-semibold mb-1">Running merge {{ merge.source }} &rarr; {{ merge.target }}</h1>
+  <p class="text-slate-500 text-sm mb-4"><a href="/" class="hover:underline">&larr; back to branches</a></p>
+
+  <div id="merge-log" class="font-mono text-xs bg-slate-900 text-slate-100 rounded p-3 h-64 overflow-y-auto">
+    {% for ev in merge.events %}
+    <div>step {{ ev.seq }} [{{ ev.status }}]{% if ev.table %} on {{ ev.table }}{% endif %}: {{ ev.note }}</div>
+    {% endfor %}
+  </div>
+  <p id="merge-status" class="mt-3 text-sm text-slate-600">
+    {% if merge.status == "done" %}Merge complete.
+    {% elif merge.status == "failed" %}Merge failed: {{ merge.error }}
+    {% else %}Running&hellip;{% endif %}
+  </p>
+</div>
+<script>
+(function () {
+  var mergeId = {{ merge.id|tojson }};
+  var status = {{ merge.status|tojson }};
+  if (status === "done" || status === "failed") { return; }
+  var log = document.getElementById("merge-log");
+  var statusEl = document.getElementById("merge-status");
+  var es = new EventSource("/merges/" + mergeId + "/events");
+  es.onmessage = function (ev) {
+    var data = JSON.parse(ev.data);
+    var line = document.createElement("div");
+    line.textContent = "step " + data.seq + " [" + data.status + "]" +
+      (data.table ? " on " + data.table : "") + ": " + data.note;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  };
+  es.addEventListener("complete", function (ev) {
+    var data = JSON.parse(ev.data);
+    statusEl.textContent = data.status === "done"
+      ? "Merge complete."
+      : ("Merge failed: " + (data.error || "unknown error"));
+    es.close();
+  });
+  es.onerror = function () { es.close(); };
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% import "base.html" as ui %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-1">Diff: {{ branch.name }} vs {{ target.name }}</h1>
+<p class="text-slate-500 text-sm mb-4"><a href="/branches/{{ branch.name }}" class="hover:underline">&larr; back to editor</a></p>
+
+<h2 class="font-semibold mt-6 mb-2">Changes</h2>
+{% if changes %}
+<ul class="space-y-1 font-mono text-sm">
+  {% for kind, desc in changes %}
+  <li><span class="text-slate-400">{{ kind }}</span> &mdash; {{ desc }}</li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="text-slate-500 text-sm">No structural differences from {{ target.name }}.</p>
+{% endif %}
+
+<h2 class="font-semibold mt-6 mb-2">Safety report</h2>
+{{ ui.plan_report(plan) }}
+
+{% if changes %}
+<form hx-post="/merges" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/merges" class="mt-4">
+  <input type="hidden" name="source" value="{{ branch.name }}">
+  <input type="hidden" name="target" value="{{ target.name }}">
+  <button type="submit" class="bg-slate-900 text-white px-4 py-2 rounded">Start merge into {{ target.name }}</button>
+</form>
+{% endif %}
+{% endblock %}
