@@ -1892,15 +1892,28 @@ CMD ["sh", "-c", "uvicorn tributary.web.app:app --host 0.0.0.0 --port ${PORT:-80
 Run: `docker compose up --build`
 Expected: `http://localhost:8000` shows the seeded demo with `main` listed. This is the "stranger runs it in one shot" check — if it needs a second command, fix it here.
 
-- [ ] **Step 3: Push to GitHub**
+- [ ] **Step 3: Do NOT push to GitHub**
 
-```bash
-gh repo create tributary --public --source=. --remote=origin --push
-```
+**Binding user instruction (given 2026-09-05): nothing is pushed to GitHub.** No `gh repo create`,
+no `git remote add`, no `git push`, no PR. The work stays local on the `build-tributary` branch and
+the user publishes it themselves when they choose.
 
-- [ ] **Step 4: Deploy on Railway**
+This is a deliberate deviation from the assignment's "GitHub repository with the code" deliverable.
+The repository is complete and ready to push — full history, one commit per task with its fixes — but
+publishing it is the user's call to make, not this build's. Leave the commits clean enough that a
+single `git push` later is all it takes.
 
-Create a project from the GitHub repo, add the Postgres plugin, set `TRIBUTARY_AUTOSEED=1`. Railway injects `DATABASE_URL` automatically. Confirm the public URL loads and a branch/diff/merge round-trip works on the deployed instance, not just locally.
+- [ ] **Step 4: Deploy on Railway — without GitHub**
+
+Railway's GitHub-source flow is unavailable given Step 3, so deploy from the local directory instead:
+`railway login` → `railway init` → `railway add` (Postgres) → `railway up`. This uploads the working
+directory directly and never touches GitHub.
+
+`railway` CLI is not installed and the user is not authenticated, so this step **requires the user**:
+they run `railway login` themselves (suggest `! railway login` in the session so its output lands in
+the conversation). Set `TRIBUTARY_AUTOSEED=1`; Railway injects `DATABASE_URL` automatically. Confirm
+the public URL loads and that a branch → diff → merge round-trip works **on the deployed instance**,
+not just locally — a deploy that boots but cannot complete a merge is not a working deliverable.
 
 - [ ] **Step 5: Commit**
 
