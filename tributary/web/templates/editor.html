@@ -26,7 +26,13 @@
 <div class="space-y-4 mb-6">
   {% for tname, table in tables.items() %}
   <div class="rounded border border-slate-200">
-    <div class="bg-slate-100 px-3 py-2 font-mono font-semibold">{{ tname }}</div>
+    <div class="bg-slate-100 px-3 py-2 font-mono font-semibold flex items-center justify-between">
+      <span>{{ tname }}</span>
+      <button hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+              hx-vals='{"op": "drop_table", "table": "{{ tname }}"}'
+              hx-confirm="Drop table &#39;{{ tname }}&#39; and all its data? This cannot be undone."
+              class="text-red-700 hover:underline text-xs font-normal">drop table</button>
+    </div>
     <div class="overflow-x-auto">
     <table class="w-full text-sm">
       <tbody>
@@ -91,6 +97,88 @@
   <div><label class="block text-xs text-slate-500">new name</label>
     <input name="new" class="border rounded px-2 py-1" required></div>
   <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Rename column</button>
+</form>
+
+<h2 class="font-semibold mb-2">Retype a column</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="alter_column_type">
+  <div><label class="block text-xs text-slate-500">table</label>
+    <input name="table" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">column</label>
+    <input name="column" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">new type</label>
+    <input name="type" class="border rounded px-2 py-1" placeholder="e.g. bigint" required></div>
+  <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Retype column</button>
+</form>
+
+<h2 class="font-semibold mb-2">Create a table</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="create_table">
+  <div><label class="block text-xs text-slate-500">table name</label>
+    <input name="table" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">columns (one "name type" per line -- a
+      bigserial "id" primary key is added automatically)</label>
+    <textarea name="columns" rows="3" class="border rounded px-2 py-1 font-mono"
+              placeholder="label text&#10;weight_grams integer"></textarea></div>
+  <button type="submit" class="bg-slate-900 text-white px-3 py-1.5 rounded">Create table</button>
+</form>
+
+<h2 class="font-semibold mb-2">Add a constraint</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="add_constraint">
+  <div><label class="block text-xs text-slate-500">table</label>
+    <input name="table" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">constraint name</label>
+    <input name="name" class="border rounded px-2 py-1" required></div>
+  <div class="flex-1"><label class="block text-xs text-slate-500">definition (as Postgres would print it,
+      e.g. CHECK (total_cents &gt;= 0), UNIQUE (email), FOREIGN KEY (user_id) REFERENCES users(id))</label>
+    <input name="definition" class="border rounded px-2 py-1 w-full font-mono" required></div>
+  <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Add constraint</button>
+</form>
+
+<h2 class="font-semibold mb-2">Drop a constraint</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="drop_constraint">
+  <div><label class="block text-xs text-slate-500">table</label>
+    <input name="table" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">constraint name</label>
+    <input name="name" class="border rounded px-2 py-1" required></div>
+  <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Drop constraint</button>
+</form>
+
+<h2 class="font-semibold mb-2">Create an index</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="create_index">
+  <div><label class="block text-xs text-slate-500">table</label>
+    <input name="table" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">index name</label>
+    <input name="name" class="border rounded px-2 py-1" required></div>
+  <div class="flex-1"><label class="block text-xs text-slate-500">definition (a full CREATE INDEX
+      statement, e.g. CREATE INDEX orders_status_idx ON orders (status))</label>
+    <input name="definition" class="border rounded px-2 py-1 w-full font-mono" required></div>
+  <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Create index</button>
+</form>
+
+<h2 class="font-semibold mb-2">Drop an index</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="drop_index">
+  <div><label class="block text-xs text-slate-500">table</label>
+    <input name="table" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">index name</label>
+    <input name="name" class="border rounded px-2 py-1" required></div>
+  <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Drop index</button>
 </form>
 
 <hr class="my-6 border-slate-200">

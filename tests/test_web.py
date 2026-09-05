@@ -50,6 +50,10 @@ import time
 
 import pytest
 
+from tributary import diff as diff_mod
+from tributary import planner
+from tributary.introspect import snapshot
+from tributary.model import AlterColumnType, TableStats
 from tributary.web import app as web_app
 
 
@@ -336,3 +340,188 @@ def test_diff_shows_safety_report(client):
                 data={"op": "add_column", "table": "users", "name": "nickname", "type": "text"})
     r = client.get("/branches/feature-x/diff?target=main")
     assert "safe_metadata" in r.text.lower()
+
+
+# --- R24: retype a column; create/drop tables; constraints and indexes ------
+#
+# `apply_change` used to support exactly four ops (add/drop/rename column,
+# rename table) -- three of the four capability groups the problem statement
+# names ("retype columns; change constraints and indexes; create and drop
+# tables") were simply unreachable from the UI even though the engine
+# underneath (`ddl.py`/`diff.py`/`planner.py`) already handled all of them.
+# Every test below goes through the real HTTP route and then re-introspects
+# Postgres directly (`introspect.snapshot`/`information_schema`) -- never
+# just checking the response was 200 -- so a change that rendered "success"
+# without actually running the DDL would be caught.
+
+def test_alter_column_type_lands_and_diff_shows_it(client, conn):
+    """The headline R24 op. Retypes `orders.status` (text, NOT NULL, with a
+    default) to `varchar(50)` through the real editor route, then checks
+    three things a broken wiring could get wrong independently: the type
+    actually changed in Postgres, NOT NULL/the default survived (a plain
+    `ALTER COLUMN ... TYPE` never touches either -- only a shadow-column
+    rewrite could lose them, and this table is far too small to take that
+    path), and the live diff against `main` reports it as an
+    `AlterColumnType`, not a drop-and-add.
+    """
+    client.post("/branches", data={"name": "feature-retype"})
+    r = client.post("/branches/feature-retype/changes",
+                     data={"op": "alter_column_type", "table": "orders",
+                           "column": "status", "type": "varchar(50)"})
+    assert r.status_code == 200
+
+    b = web_app._find_branch(conn, "feature-retype")
+    row = conn.execute(
+        "SELECT data_type, character_maximum_length, is_nullable, column_default "
+        "FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = 'orders' AND column_name = 'status'",
+        (b.schema_name,),
+    ).fetchone()
+    assert row[0] == "character varying"
+    assert row[1] == 50
+    assert row[2] == "NO"        # NOT NULL preserved
+    assert row[3] is not None    # DEFAULT preserved
+
+    diff_r = client.get("/branches/feature-retype/diff?target=main")
+    assert diff_r.status_code == 200
+    assert "AlterColumnType" in diff_r.text
+
+
+def test_retype_on_large_table_produces_a_backfill_step(client, conn):
+    """The UI path reaching the shadow-column mechanism end to end: the
+    retype itself lands through the real `POST .../changes` route (the same
+    route the test above uses), on `orders` (seeded with ~2000 real rows by
+    autoseed -- modest, not a genuinely large table). The planner's size
+    threshold is then forced past the "large" line with an explicit
+    `TableStats` override, the same technique `tests/test_planner.py` uses
+    throughout, rather than actually building a multi-GB table in the suite.
+    `orders.total_cents` (integer) -> `text` is not binary-coercible, so at
+    a forced-large size with `orders`'s single-column primary key known,
+    this must route through `_shadow_dance` and produce a `backfill` step.
+    """
+    client.post("/branches", data={"name": "feature-retype-big"})
+    r = client.post("/branches/feature-retype-big/changes",
+                     data={"op": "alter_column_type", "table": "orders",
+                           "column": "total_cents", "type": "text"})
+    assert r.status_code == 200
+
+    b = web_app._find_branch(conn, "feature-retype-big")
+    main_snap = snapshot(conn, "main")
+    branch_snap = snapshot(conn, b.schema_name)
+    changes = diff_mod.diff(main_snap, branch_snap)
+    assert any(isinstance(c, AlterColumnType) and c.table == "orders" and c.column == "total_cents"
+               for c in changes)
+
+    forced_stats = {"orders": TableStats(rows=2_000_000, bytes=200 * 1024 * 1024)}
+    pk_columns = web_app._pk_columns(main_snap)
+    plan_result = planner.plan(changes, forced_stats, b.schema_name, pk_columns=pk_columns)
+    kinds = {s.kind for s in plan_result.steps}
+    assert "backfill" in kinds
+    assert "swap" in kinds
+
+
+def test_create_table_lands_with_a_primary_key(client, conn):
+    client.post("/branches", data={"name": "feature-newtable"})
+    r = client.post("/branches/feature-newtable/changes",
+                     data={"op": "create_table", "table": "widgets",
+                           "columns": "label text\nweight_grams integer"})
+    assert r.status_code == 200
+
+    b = web_app._find_branch(conn, "feature-newtable")
+    snap = snapshot(conn, b.schema_name)
+    assert "widgets" in snap.tables
+    widgets = snap.tables["widgets"]
+    assert set(widgets.columns) == {"id", "label", "weight_grams"}
+    pk = next(c for c in widgets.constraints.values() if c.kind == "p")
+    assert pk.columns == ("id",)
+
+
+def test_drop_table_requires_confirmation_and_removes_it(client, conn):
+    """Dropping a table is destructive (R24 brief): the editor's drop-table
+    control must carry a real, explicit confirmation step, not a bare
+    button -- checked here via the same `hx-confirm` markup the existing
+    branch-delete control already uses (`branches.html`), not just the word
+    "drop" appearing somewhere on the page.
+    """
+    client.post("/branches", data={"name": "feature-droptable"})
+    editor_html = client.get("/branches/feature-droptable").text
+    assert 'hx-confirm="Drop table' in editor_html
+
+    r = client.post("/branches/feature-droptable/changes",
+                     data={"op": "drop_table", "table": "orders"})
+    assert r.status_code == 200
+
+    b = web_app._find_branch(conn, "feature-droptable")
+    snap = snapshot(conn, b.schema_name)
+    assert "orders" not in snap.tables
+
+
+def test_add_constraint_lands(client, conn):
+    client.post("/branches", data={"name": "feature-constraint"})
+    r = client.post("/branches/feature-constraint/changes",
+                     data={"op": "add_constraint", "table": "orders",
+                           "name": "orders_total_nonneg",
+                           "definition": "CHECK (total_cents >= 0)"})
+    assert r.status_code == 200
+
+    b = web_app._find_branch(conn, "feature-constraint")
+    snap = snapshot(conn, b.schema_name)
+    con = snap.tables["orders"].constraints.get("orders_total_nonneg")
+    assert con is not None
+    assert con.kind == "c"
+
+
+def test_add_constraint_with_bad_sql_is_a_sentence_not_a_traceback(client):
+    """Constraint/index definitions are accepted as raw SQL text and handed
+    straight to Postgres to validate (R24 brief) -- a definition Postgres
+    rejects (here: a CHECK referencing a column that doesn't exist) must
+    come back as a readable sentence, never a 500 with a traceback.
+    """
+    client.post("/branches", data={"name": "feature-badcon"})
+    r = client.post("/branches/feature-badcon/changes",
+                     data={"op": "add_constraint", "table": "orders", "name": "bad",
+                           "definition": "CHECK (nonexistent_column > 0)"})
+    assert r.status_code == 400
+    assert "traceback" not in r.text.lower()
+    assert "internal server error" not in r.text.lower()
+
+
+def test_drop_constraint_removes_it(client, conn):
+    client.post("/branches", data={"name": "feature-dropcon"})
+    b = web_app._find_branch(conn, "feature-dropcon")
+    before = snapshot(conn, b.schema_name).tables["users"].constraints
+    assert "users_email_key" in before
+
+    r = client.post("/branches/feature-dropcon/changes",
+                     data={"op": "drop_constraint", "table": "users", "name": "users_email_key"})
+    assert r.status_code == 200
+
+    after = snapshot(conn, b.schema_name).tables["users"].constraints
+    assert "users_email_key" not in after
+
+
+def test_create_index_lands(client, conn):
+    client.post("/branches", data={"name": "feature-index"})
+    r = client.post("/branches/feature-index/changes",
+                     data={"op": "create_index", "table": "orders",
+                           "name": "orders_status_idx",
+                           "definition": "CREATE INDEX orders_status_idx ON orders (status)"})
+    assert r.status_code == 200
+
+    b = web_app._find_branch(conn, "feature-index")
+    snap = snapshot(conn, b.schema_name)
+    assert "orders_status_idx" in snap.tables["orders"].indexes
+
+
+def test_drop_index_removes_it(client, conn):
+    client.post("/branches", data={"name": "feature-dropindex"})
+    b = web_app._find_branch(conn, "feature-dropindex")
+    before = snapshot(conn, b.schema_name).tables["orders"].indexes
+    assert "orders_user_id_idx" in before
+
+    r = client.post("/branches/feature-dropindex/changes",
+                     data={"op": "drop_index", "table": "orders", "name": "orders_user_id_idx"})
+    assert r.status_code == 200
+
+    after = snapshot(conn, b.schema_name).tables["orders"].indexes
+    assert "orders_user_id_idx" not in after

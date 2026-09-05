@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -87,6 +88,7 @@ from tributary.model import (
     AddConstraint,
     AlterColumnType,
     Column,
+    Constraint,
     CreateIndex,
     CreateTable,
     DropColumn,
@@ -95,12 +97,14 @@ from tributary.model import (
     DropIndex,
     DropNotNull,
     DropTable,
+    Index,
     Plan,
     RenameColumn,
     RenameTable,
     SetDefault,
     SetNotNull,
     Snapshot,
+    Table,
 )
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -379,8 +383,104 @@ def editor(branch: str, request: Request, conn=Depends(get_conn)):
     return _editor_response(request, conn, branch)
 
 
+_NEW_TABLE_COLUMN_RE = re.compile(r"^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<type>.+?)\s*$")
+
+
+def _parse_new_table_columns(text: str) -> list[tuple[str, str]]:
+    """Parse `create_table`'s freeform "one column per line, name then type"
+    textarea into `(name, type)` pairs. Blank lines are skipped. A line that
+    isn't "name type" raises `ValueError` -- rendered as a sentence by the
+    caller, never silently dropped.
+    """
+    result: list[tuple[str, str]] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        m = _NEW_TABLE_COLUMN_RE.match(line)
+        if not m:
+            raise ValueError(
+                f"could not parse column definition on line {lineno} ({line!r}) -- "
+                "expected 'name type', e.g. 'label text'"
+            )
+        result.append((m.group("name"), m.group("type")))
+    return result
+
+
+def _build_new_table(name: str, extra: list[tuple[str, str]]) -> Table:
+    """Build a minimal, well-formed `Table` for `create_table`: a `bigserial`
+    primary key column named `id`, plus whatever extra columns the form
+    supplied (all nullable, no default -- `NOT NULL`/a default can be added
+    afterwards via the existing `add_column` path). Branch materialisation
+    and the planner both assume a table is well-formed (R24 brief); a table
+    built here always has a primary key.
+    """
+    cols: dict[str, Column] = {
+        "id": Column(name="id", type="bigserial", nullable=False, default=None, position=1),
+    }
+    for i, (cname, ctype) in enumerate(extra, start=2):
+        cols[cname] = Column(name=cname, type=ctype, nullable=True, default=None, position=i)
+    pk_name = f"{name}_pkey"
+    constraints = {
+        pk_name: Constraint(name=pk_name, kind="p", definition="PRIMARY KEY (id)", columns=("id",)),
+    }
+    return Table(name=name, columns=cols, constraints=constraints, indexes={})
+
+
+_CONSTRAINT_KIND_RE = re.compile(
+    r"^\s*(?P<kw>PRIMARY\s+KEY|FOREIGN\s+KEY|UNIQUE|CHECK)\b", re.IGNORECASE)
+_CONSTRAINT_KIND_MAP = {"PRIMARY": "p", "FOREIGN": "f", "UNIQUE": "u", "CHECK": "c"}
+_COLLIST_RE = re.compile(r"\(([^)]*)\)")
+_CREATE_UNIQUE_INDEX_RE = re.compile(r"(?i)^\s*create\s+unique\s+index\b")
+
+
+def _infer_constraint_kind(definition: str) -> str:
+    """`Constraint.kind` ('p'/'f'/'u'/'c') from the leading keyword of a
+    hand-typed definition -- the same vocabulary `pg_get_constraintdef`
+    itself always starts with. Anything else is rejected with a sentence,
+    not silently guessed at, since `kind` drives which rewrite the planner
+    picks (R24 brief: this is exactly where the NOT VALID/VALIDATE split and
+    the PRIMARY KEY/UNIQUE CONCURRENTLY-index build matter).
+    """
+    m = _CONSTRAINT_KIND_RE.match(definition)
+    if not m:
+        raise ValueError(
+            "could not tell what kind of constraint this is -- start the definition with "
+            "CHECK, UNIQUE, PRIMARY KEY, or FOREIGN KEY (e.g. \"CHECK (total_cents >= 0)\")"
+        )
+    return _CONSTRAINT_KIND_MAP[m.group("kw").split()[0].upper()]
+
+
+def _infer_constraint_columns(kind: str, definition: str) -> tuple[str, ...]:
+    """Best-effort column list for a `p`/`u` constraint -- needed by the
+    planner's large-table PRIMARY KEY/UNIQUE index-build rewrite (R21).
+    `c`/`f` definitions' parentheses hold an expression or a foreign-key
+    clause, not a plain column list, so those are left empty rather than
+    misparsed.
+    """
+    if kind not in ("p", "u"):
+        return ()
+    m = _COLLIST_RE.search(definition)
+    if not m:
+        return ()
+    return tuple(c.strip().strip('"') for c in m.group(1).split(",") if c.strip())
+
+
+def _exec_unqualified_ddl(conn, schema: str, stmt: str) -> None:
+    """Run `stmt` -- a hand-typed constraint/index definition that (like the
+    `pg_get_constraintdef`/`pg_get_indexdef` output it mirrors) may embed an
+    *unqualified* table name -- with `search_path` pointed at `schema` for
+    the duration of one real transaction, the same trick `introspect.snapshot`
+    and `store._materialise` already use for exactly this reason. Without
+    this, an unqualified `... ON orders (...)` would resolve through the
+    connection's ambient search_path and land on the wrong schema entirely.
+    """
+    with conn.transaction():
+        conn.execute(pgsql.SQL("SET LOCAL search_path TO {}").format(pgsql.Identifier(schema)))
+        conn.execute(stmt)
+
+
 def _apply_op(conn, schema: str, op: str, *, table, column, col_name, coltype,
-              old, new, not_null, default) -> dict:
+              old, new, not_null, default, definition, new_table_columns) -> dict:
     """Execute one edit against `schema`'s *live* tables (via
     `ddl.render`, never a hand-built string) and return the op-log entry to
     remember it by. Raises `ValueError` for a request missing the fields its
@@ -412,6 +512,69 @@ def _apply_op(conn, schema: str, op: str, *, table, column, col_name, coltype,
         conn.execute(render_ddl(RenameTable(old=old, new=new), schema))
         return {"op": "rename_table", "old": old, "new": new}
 
+    if op == "alter_column_type":
+        if not table or not column or not coltype:
+            raise ValueError("alter_column_type needs a table, a column, and a new type")
+        current_snap = snapshot(conn, schema)
+        current_table = current_snap.tables.get(table)
+        if current_table is None or column not in current_table.columns:
+            raise ValueError(f"no such column {column!r} on table {table!r}")
+        current_col = current_table.columns[column]
+        # R20: old_type/nullable/default come from the column's *current*
+        # live state, so the planner's shadow-column swap (for a rewriting
+        # retype on a large table) can restore what it would otherwise drop
+        # -- see AlterColumnType's own docstring in tributary/model.py.
+        change = AlterColumnType(table=table, column=column, old_type=current_col.type,
+                                  new_type=coltype, nullable=current_col.nullable,
+                                  default=current_col.default)
+        conn.execute(render_ddl(change, schema))
+        return {"op": "alter_column_type", "table": table, "column": column, "new_type": coltype}
+
+    if op == "create_table":
+        if not table:
+            raise ValueError("create_table needs a table name")
+        extra = _parse_new_table_columns(new_table_columns or "")
+        new_table = _build_new_table(table, extra)
+        conn.execute(render_ddl(CreateTable(table=new_table), schema))
+        return {"op": "create_table", "table": table}
+
+    if op == "drop_table":
+        if not table:
+            raise ValueError("drop_table needs a table")
+        conn.execute(render_ddl(DropTable(table=table), schema))
+        return {"op": "drop_table", "table": table}
+
+    if op == "add_constraint":
+        if not table or not col_name or not definition:
+            raise ValueError("add_constraint needs a table, a constraint name, and a definition")
+        kind = _infer_constraint_kind(definition)
+        con = Constraint(name=col_name, kind=kind, definition=definition,
+                          columns=_infer_constraint_columns(kind, definition))
+        stmt = render_ddl(AddConstraint(table=table, constraint=con), schema)
+        _exec_unqualified_ddl(conn, schema, stmt)
+        return {"op": "add_constraint", "table": table, "name": col_name, "definition": definition}
+
+    if op == "drop_constraint":
+        if not table or not col_name:
+            raise ValueError("drop_constraint needs a table and a constraint name")
+        conn.execute(render_ddl(DropConstraint(table=table, constraint=col_name), schema))
+        return {"op": "drop_constraint", "table": table, "constraint": col_name}
+
+    if op == "create_index":
+        if not table or not col_name or not definition:
+            raise ValueError("create_index needs a table, an index name, and a definition")
+        idx = Index(name=col_name, definition=definition, columns=(),
+                    unique=bool(_CREATE_UNIQUE_INDEX_RE.match(definition)))
+        stmt = render_ddl(CreateIndex(table=table, index=idx), schema)
+        _exec_unqualified_ddl(conn, schema, stmt)
+        return {"op": "create_index", "table": table, "name": col_name, "definition": definition}
+
+    if op == "drop_index":
+        if not table or not col_name:
+            raise ValueError("drop_index needs a table and an index name")
+        conn.execute(render_ddl(DropIndex(table=table, index=col_name), schema))
+        return {"op": "drop_index", "table": table, "index": col_name}
+
     raise ValueError(f"unknown edit {op!r}")
 
 
@@ -428,6 +591,8 @@ def apply_change(
     new: str | None = Form(None),
     not_null: str | None = Form(None),
     default: str | None = Form(None),
+    definition: str | None = Form(None),
+    new_table_columns: str | None = Form(None, alias="columns"),
     conn=Depends(get_conn),
 ):
     b = _find_branch(conn, branch)
@@ -436,7 +601,8 @@ def apply_change(
     try:
         entry = _apply_op(conn, b.schema_name, op, table=table, column=column,
                            col_name=col_name, coltype=coltype, old=old, new=new,
-                           not_null=not_null, default=default)
+                           not_null=not_null, default=default, definition=definition,
+                           new_table_columns=new_table_columns)
     except (ValueError, psycopg.Error) as e:
         return _editor_response(request, conn, branch, status_code=400, error=str(e))
     with _LOCK:
