@@ -525,3 +525,103 @@ def test_drop_index_removes_it(client, conn):
 
     after = snapshot(conn, b.schema_name).tables["orders"].indexes
     assert "orders_user_id_idx" not in after
+
+
+# --- final fix wave: rename-table UI wiring (item 1) -------------------------
+#
+# `_apply_op`'s `rename_table` op, `ddl.render`, and `diff.py`'s R16
+# protection (RenameTable, never Drop+Create) all worked correctly before
+# this fix -- but no form in editor.html ever produced a `rename_table` op,
+# so the only UI path to "rename a table" was drop the old one and create a
+# new one under the new name, which diffs as DropTable + CreateTable and
+# destroys every row against a populated table. This test checks both
+# halves: the form now actually exists in the rendered page (the missing
+# piece), and, through the real HTTP route, the op lands in Postgres and
+# diffs as a RenameTable with no DropTable -- proving the op log was
+# genuinely written, not inferred after the fact from a drop-and-create.
+def test_rename_table_form_lands_and_diffs_as_rename_not_drop(client, conn):
+    client.post("/branches", data={"name": "feature-renametable"})
+
+    editor_html = client.get("/branches/feature-renametable").text
+    assert 'value="rename_table"' in editor_html, (
+        "no rename-table form in editor.html -- the only UI path to renaming "
+        "a table is still drop-old + create-new, which diffs as a destructive "
+        "DropTable + CreateTable against a populated table"
+    )
+
+    r = client.post("/branches/feature-renametable/changes",
+                     data={"op": "rename_table", "old": "orders", "new": "purchases"})
+    assert r.status_code == 200
+
+    b = web_app._find_branch(conn, "feature-renametable")
+    snap = snapshot(conn, b.schema_name)
+    assert "purchases" in snap.tables
+    assert "orders" not in snap.tables
+
+    diff_r = client.get("/branches/feature-renametable/diff?target=main")
+    assert diff_r.status_code == 200
+    assert "RenameTable" in diff_r.text
+    assert "DropTable" not in diff_r.text
+
+
+# --- final fix wave: drop_column/rename_column had zero web-layer tests -----
+# (item 3) -- their wiring was correct, but only ever verified by inspection.
+
+def test_drop_column_lands(client, conn):
+    client.post("/branches", data={"name": "feature-dropcolumn"})
+    r = client.post("/branches/feature-dropcolumn/changes",
+                     data={"op": "drop_column", "table": "users", "column": "full_name"})
+    assert r.status_code == 200
+
+    b = web_app._find_branch(conn, "feature-dropcolumn")
+    snap = snapshot(conn, b.schema_name)
+    assert "full_name" not in snap.tables["users"].columns
+
+
+def test_rename_column_lands(client, conn):
+    client.post("/branches", data={"name": "feature-renamecolumn"})
+    r = client.post("/branches/feature-renamecolumn/changes",
+                     data={"op": "rename_column", "table": "users",
+                           "old": "full_name", "new": "display_name"})
+    assert r.status_code == 200
+
+    b = web_app._find_branch(conn, "feature-renamecolumn")
+    snap = snapshot(conn, b.schema_name)
+    assert "display_name" in snap.tables["users"].columns
+    assert "full_name" not in snap.tables["users"].columns
+
+
+# --- final fix wave: show_diff's `except ValueError` had no coverage -------
+# (item 4)
+
+def test_diff_against_nonexistent_target_is_a_sentence_not_a_traceback(client):
+    client.post("/branches", data={"name": "feature-x"})
+    r = client.get("/branches/feature-x/diff?target=does-not-exist")
+    assert r.status_code == 404
+    assert "does-not-exist" in r.text
+    assert "traceback" not in r.text.lower()
+
+
+def test_show_diff_wraps_a_domain_value_error_as_a_sentence(client, monkeypatch):
+    """The `if t is None` guard just above (exercised by the test above)
+    already turns a missing *branch* into a 404 sentence before `show_diff`
+    ever reaches its own `try`/`except ValueError` around `diff`/`planner.plan`
+    -- so that block, unlike every other plan-building path in this module,
+    currently has no reachable input through `diff.py`/`planner.py` as they
+    stand (both only ever raise `TypeError` for a genuinely unhandled
+    `Change`). Rather than leave the branch entirely unexercised, this test
+    forces the one failure it exists to guard against directly at the
+    boundary it wraps, and pins the behaviour that actually matters: a
+    `ValueError` surfacing from that stage must still render as a sentence
+    with a non-500 status, never a bare traceback.
+    """
+    client.post("/branches", data={"name": "feature-diffvalueerror"})
+
+    def boom(*a, **k):
+        raise ValueError("no such branch 'ghost'")
+
+    monkeypatch.setattr(web_app.planner, "plan", boom)
+    r = client.get("/branches/feature-diffvalueerror/diff?target=main")
+    assert r.status_code == 404
+    assert "ghost" in r.text
+    assert "traceback" not in r.text.lower()

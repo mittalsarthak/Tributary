@@ -113,6 +113,18 @@
   <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Retype column</button>
 </form>
 
+<h2 class="font-semibold mb-2">Rename a table</h2>
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      method="post" action="/branches/{{ branch.name }}/changes"
+      class="flex flex-wrap gap-2 items-end mb-6 text-sm">
+  <input type="hidden" name="op" value="rename_table">
+  <div><label class="block text-xs text-slate-500">old name</label>
+    <input name="old" class="border rounded px-2 py-1" required></div>
+  <div><label class="block text-xs text-slate-500">new name</label>
+    <input name="new" class="border rounded px-2 py-1" required></div>
+  <button type="submit" class="bg-slate-700 text-white px-3 py-1.5 rounded">Rename table</button>
+</form>
+
 <h2 class="font-semibold mb-2">Create a table</h2>
 <form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"

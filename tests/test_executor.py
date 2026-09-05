@@ -331,3 +331,36 @@ def test_preflight_aborts_set_not_null_when_nulls_exist_leaving_no_trace(
     assert not any("notnull" in name for name in cons), (
         "the NOT NULL scaffold constraint must never have been added"
     )
+
+
+# --- final fix wave: a failed CIC must still restore search_path -----------
+# (item 4) -- the restore lives in a `finally` shared with the success path
+# (already covered above by the R14 test), but the failure path through that
+# same `finally` was only ever checked once by a throwaway probe during
+# development and never committed as a real test.
+
+def test_run_step_restores_search_path_after_a_failed_concurrent_index(conn, fresh_schema):
+    """Forces a real `CREATE INDEX CONCURRENTLY` failure -- a UNIQUE index
+    over a column with a duplicate value, which Postgres only detects once
+    it scans existing rows, not up front -- and checks that the *same*
+    connection's `search_path` is back to what it was before `run_step` ever
+    touched it. Calls `run_step` directly (the module's own public per-step
+    primitive, per its docstring) rather than the full `executor.run`, since
+    `run()` opens and closes its own connections internally and this needs
+    to inspect the one connection's search_path after the failure, before
+    anything closes it.
+    """
+    conn.execute(f'CREATE TABLE "{fresh_schema}".dupes (id int PRIMARY KEY, val int)')
+    conn.execute(f'INSERT INTO "{fresh_schema}".dupes VALUES (1, 1), (2, 1)')
+
+    idx = Index("ix_dupe", f'CREATE UNIQUE INDEX ix_dupe ON "{fresh_schema}".dupes (val)', ("val",))
+    p = plan([CreateIndex("dupes", idx)],
+             {"dupes": TableStats(rows=5_000_000, bytes=900_000_000)},
+             fresh_schema)
+    step = next(s for s in p.steps if s.kind == "index_concurrent")
+
+    before = conn.execute("SHOW search_path").fetchone()[0]
+    with pytest.raises(executor.StepFailed):
+        executor.run_step(conn, step, schema=fresh_schema, lock_timeout="3s")
+    after = conn.execute("SHOW search_path").fetchone()[0]
+    assert after == before

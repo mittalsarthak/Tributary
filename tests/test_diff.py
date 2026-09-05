@@ -9,11 +9,14 @@ from tributary.model import (
     CreateTable,
     DropColumn,
     DropConstraint,
+    DropDefault,
     DropIndex,
+    DropNotNull,
     DropTable,
     Index,
     RenameColumn,
     RenameTable,
+    SetDefault,
     SetNotNull,
     Snapshot,
     Table,
@@ -241,3 +244,45 @@ def test_change_ordering_is_drops_then_tables_then_columns_then_creates():
     assert max(drop_positions) < min(table_positions)
     assert max(table_positions) < min(column_positions)
     assert max(column_positions) < min(create_positions)
+
+
+# --- final fix wave: cheap coverage gaps (item 4) ---------------------------
+
+def test_table_rename_plus_column_rename_logged_under_the_old_table_name():
+    """R16 + a column rename together in one commit, with the column rename
+    logged under the table's *pre*-rename name -- the order a real editor
+    session would actually produce it in (the column was renamed while the
+    table was still called `users`; the table itself was renamed afterward,
+    as a separate op). `_diff_columns`'s op-log lookup tries
+    `(new_table, old_col)` first and falls back to `(old_table, old_col)`
+    (diff.py:275) -- this exercises that fallback specifically.
+    """
+    a = Snapshot({"users": tbl("users", id="int8", email="text")})
+    b = Snapshot({"accounts": tbl("accounts", id="int8", email_address="text")})
+    ops = [
+        {"op": "rename_column", "table": "users", "old": "email", "new": "email_address"},
+        {"op": "rename_table", "old": "users", "new": "accounts"},
+    ]
+    changes = diff(a, b, ops)
+    assert changes == [
+        RenameTable("users", "accounts"),
+        RenameColumn("accounts", "email", "email_address"),
+    ]
+
+
+def test_drop_not_null_is_detected():
+    a = Snapshot({"users": Table("users", columns={"e": Column("e", "text", False, None, 1)})})
+    b = Snapshot({"users": Table("users", columns={"e": Column("e", "text", True, None, 1)})})
+    assert diff(a, b) == [DropNotNull("users", "e")]
+
+
+def test_set_default_is_detected():
+    a = Snapshot({"users": Table("users", columns={"e": Column("e", "text", True, None, 1)})})
+    b = Snapshot({"users": Table("users", columns={"e": Column("e", "text", True, "'x'", 1)})})
+    assert diff(a, b) == [SetDefault("users", "e", "'x'")]
+
+
+def test_drop_default_is_detected():
+    a = Snapshot({"users": Table("users", columns={"e": Column("e", "text", True, "'x'", 1)})})
+    b = Snapshot({"users": Table("users", columns={"e": Column("e", "text", True, None, 1)})})
+    assert diff(a, b) == [DropDefault("users", "e")]

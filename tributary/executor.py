@@ -520,7 +520,15 @@ def run(
 
     tx_conn = psycopg.connect(dsn)
     tx_conn.autocommit = False
-    nontx_conn = psycopg.connect(dsn)
+    try:
+        nontx_conn = psycopg.connect(dsn)
+    except BaseException:
+        # If the second connect fails (e.g. hitting max_connections), the
+        # first connection must still be closed here -- the try/finally
+        # below that closes both has not started yet at this point, so
+        # nothing else would ever close tx_conn otherwise.
+        tx_conn.close()
+        raise
     nontx_conn.autocommit = True
 
     try:
