@@ -3,6 +3,8 @@ import uuid
 import pytest
 import psycopg
 
+from tributary import store
+
 
 @pytest.fixture(scope="session")
 def pg_dsn() -> str:
@@ -29,3 +31,22 @@ def fresh_schema(conn):
     conn.execute(f'CREATE SCHEMA "{name}"')
     yield name
     conn.execute(f'DROP SCHEMA "{name}" CASCADE')
+
+
+@pytest.fixture
+def ws(conn):
+    """A `conn` with `_tributary` initialised and `main` adopted, carrying one
+    seed table (`main.users`). Shared by Task 6's branch/commit tests and
+    Task 7's merge tests (R2) -- defined here, not in a single test module,
+    so both can import it.
+    """
+    store.init(conn)
+    conn.execute("CREATE SCHEMA IF NOT EXISTS main")
+    conn.execute("CREATE TABLE IF NOT EXISTS main.users (id bigserial PRIMARY KEY, email text)")
+    store.ensure_main(conn)
+    yield conn
+    conn.execute("DROP SCHEMA IF EXISTS main CASCADE")
+    conn.execute("DROP SCHEMA IF EXISTS _tributary CASCADE")
+    for (s,) in conn.execute("SELECT nspname FROM pg_namespace "
+                              "WHERE nspname LIKE 'br\\_%'").fetchall():
+        conn.execute(f'DROP SCHEMA "{s}" CASCADE')
