@@ -39,6 +39,37 @@ def test_snapshot_of_empty_schema_is_empty(conn, fresh_schema):
     assert snapshot(conn, fresh_schema).tables == {}
 
 
+def test_snapshot_includes_table_with_no_columns(conn, fresh_schema):
+    # RULING R13: `CREATE TABLE t()` is legal Postgres. A table must be
+    # seeded into the snapshot by its own existence, independent of whether
+    # it has any columns, or it silently disappears from the snapshot
+    # entirely -- indistinguishable, to diff, from a dropped table.
+    conn.execute(f"CREATE TABLE {fresh_schema}.empty ()")
+    snap = snapshot(conn, fresh_schema)
+    assert "empty" in snap.tables
+    empty = snap.tables["empty"]
+    assert empty.columns == {}
+    assert empty.constraints == {}
+    assert empty.indexes == {}
+
+
+def test_dropping_last_column_does_not_make_table_vanish_from_snapshot(conn, fresh_schema):
+    # RULING R13 -- the real consequence this guards against: a table that
+    # is present in the database but absent from the snapshot reads to
+    # diff as a dropped table, and merge would issue a DropTable against a
+    # real table nobody asked to drop. Losing the last column must not be
+    # able to trigger that.
+    conn.execute(f"CREATE TABLE {fresh_schema}.shrinking (only_col int)")
+    before = snapshot(conn, fresh_schema)
+    assert "shrinking" in before.tables
+    assert list(before.tables["shrinking"].columns) == ["only_col"]
+
+    conn.execute(f"ALTER TABLE {fresh_schema}.shrinking DROP COLUMN only_col")
+    after = snapshot(conn, fresh_schema)
+    assert "shrinking" in after.tables
+    assert after.tables["shrinking"].columns == {}
+
+
 def test_snapshot_ignores_other_schemas(conn, fresh_schema):
     conn.execute(DDL.format(s=fresh_schema))
     other = fresh_schema + "_x"

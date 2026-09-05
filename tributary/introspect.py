@@ -16,6 +16,13 @@ from __future__ import annotations
 from tributary.canonical import norm_default, norm_type
 from tributary.model import Column, Constraint, Index, Snapshot, Table, TableStats
 
+_TABLES = """
+SELECT c.relname
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %s AND c.relkind = 'r'
+"""
+
 _COLS = """
 SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
        NOT a.attnotnull, pg_get_expr(d.adbin, d.adrelid), a.attnum
@@ -76,8 +83,18 @@ def snapshot(conn, schema: str) -> Snapshot:
 
     Only objects belonging to `schema` are included -- every query filters
     on `n.nspname = %s`, so nothing from another schema can leak in.
+
+    Tables are seeded from `_TABLES` independently of their columns, before
+    the columns/constraints/indexes loops run: a table with zero columns
+    (`CREATE TABLE t()`, or every column later dropped) is legal Postgres
+    and must still appear in the snapshot with empty `columns` -- if it
+    silently disappeared instead, diff would read a real table as dropped
+    and merge would issue a `DropTable` nobody asked for.
     """
     tables: dict[str, Table] = {}
+
+    for (relname,) in conn.execute(_TABLES, (schema,)):
+        _get_table(tables, relname)
 
     for relname, attname, raw_type, nullable, raw_default, attnum in conn.execute(_COLS, (schema,)):
         table = _get_table(tables, relname)
