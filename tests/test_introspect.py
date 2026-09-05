@@ -60,14 +60,30 @@ def test_table_stats_reports_size(conn, fresh_schema):
     assert st.bytes > 0
 
 
-def test_table_stats_of_never_analyzed_table_is_nonnegative(conn, fresh_schema):
-    # reltuples is -1 for a table that has never been ANALYZEd; the stats
-    # query must clamp that to a sane non-negative row count rather than
-    # surfacing -1 to the migration planner.
+def test_table_stats_of_never_analyzed_table_is_unknown(conn, fresh_schema):
+    # RULING R12: reltuples is -1 for a table that has never been ANALYZEd.
+    # That must surface as rows=None (unknown), never as a confident 0 --
+    # a freshly-restored, never-analysed multi-GB table reading as "0 rows"
+    # would be handed a naive ALTER TABLE that takes an ACCESS EXCLUSIVE
+    # lock for a full table rewrite, which is exactly the outage this
+    # project exists to prevent. bytes (real disk usage) must still be
+    # reported and positive regardless.
     conn.execute(f"CREATE TABLE {fresh_schema}.fresh (id int)")
     conn.execute(f"INSERT INTO {fresh_schema}.fresh SELECT * FROM generate_series(1, 50)")
     st = table_stats(conn, fresh_schema)["fresh"]
-    assert st.rows >= 0
+    assert st.rows is None
+    assert st.bytes > 0
+
+
+def test_table_stats_reports_known_rows_after_analyze(conn, fresh_schema):
+    # The other half of RULING R12: unknown before ANALYZE, known (a real
+    # int, not None) after. Same table as the test above, post-ANALYZE.
+    conn.execute(f"CREATE TABLE {fresh_schema}.fresh (id int)")
+    conn.execute(f"INSERT INTO {fresh_schema}.fresh SELECT * FROM generate_series(1, 50)")
+    conn.execute(f"ANALYZE {fresh_schema}.fresh")
+    st = table_stats(conn, fresh_schema)["fresh"]
+    assert st.rows is not None
+    assert st.rows >= 45
 
 
 def test_unique_constraint_backed_index_is_not_duplicated_as_index(conn, fresh_schema):

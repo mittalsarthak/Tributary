@@ -56,7 +56,7 @@ WHERE n.nspname = %s AND x.indisprimary = FALSE
 
 _STATS = """
 SELECT c.relname,
-       GREATEST(c.reltuples, 0)::bigint,
+       c.reltuples::bigint,
        pg_total_relation_size(c.oid)::bigint
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = %s AND c.relkind = 'r'
@@ -117,11 +117,21 @@ def snapshot(conn, schema: str) -> Snapshot:
 def table_stats(conn, schema: str) -> dict[str, TableStats]:
     """Measured size of every table in `schema`.
 
-    `reltuples` is -1 on a table that has never been ANALYZEd; the query
-    clamps it to 0 with GREATEST so a never-analysed table reports a sane
-    (non-negative) row count instead of -1.
+    `rows` (`pg_class.reltuples`) is a planner *estimate*, not a count, and
+    it is `None` -- unknown, not zero -- until the table has been ANALYZEd
+    at least once (Postgres reports it as -1 for a never-analysed table).
+    Callers must never treat `None` as 0: a freshly-restored, never-analysed
+    multi-GB table would otherwise read as "small" and be handed a naive
+    `ALTER TABLE` that takes an ACCESS EXCLUSIVE lock for a full rewrite.
+
+    `bytes` (`pg_total_relation_size`) is always exact on-disk usage --
+    never an estimate, regardless of whether the table has been analysed --
+    and is the signal to trust when `rows` is `None`.
     """
-    return {
-        relname: TableStats(rows=rows, bytes=nbytes)
-        for relname, rows, nbytes in conn.execute(_STATS, (schema,))
-    }
+    stats = {}
+    for relname, reltuples, nbytes in conn.execute(_STATS, (schema,)):
+        stats[relname] = TableStats(
+            rows=None if reltuples < 0 else reltuples,
+            bytes=nbytes,
+        )
+    return stats

@@ -258,7 +258,7 @@ class Safety(StrEnum):
 
 @dataclass(frozen=True)
 class TableStats:
-    rows: int
+    rows: int | None  # None: never analysed, row count unknown -- do not read as 0
     bytes: int
 
 
