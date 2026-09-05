@@ -1,6 +1,8 @@
 import json
 import uuid
 
+from psycopg import sql
+
 from tributary.introspect import snapshot, table_stats
 
 DDL = """
@@ -150,7 +152,7 @@ def test_snapshot_is_byte_stable_across_repeated_introspection(conn, fresh_schem
     assert first == second
 
 
-def _build_two_table_schema(conn, s, id_type, str_type, ts_type, ts_default):
+def _build_two_table_schema(conn, s, id_type, str_type, ts_type, ts_default, extra_indexes=True):
     # A table, a standalone index, a unique constraint, and a foreign key to
     # a second table -- every place a schema-qualified definition (via
     # pg_get_indexdef / pg_get_constraintdef) could leak the source schema
@@ -161,11 +163,23 @@ def _build_two_table_schema(conn, s, id_type, str_type, ts_type, ts_default):
           id {id_type} PRIMARY KEY,
           widget_id {id_type} REFERENCES {s}.widgets(id),
           email {str_type} NOT NULL,
+          status text NOT NULL DEFAULT 'active',
           created_at {ts_type} DEFAULT {ts_default},
           CONSTRAINT gadgets_email_key UNIQUE (email)
         );
         CREATE UNIQUE INDEX ix_gadgets_widget_id ON {s}.gadgets (widget_id);
     """)
+    if extra_indexes:
+        # RULING R17(1): a partial index and an expression index -- the two
+        # shapes where pg_get_indexdef's pretty=true form rewrites the text
+        # (stripping outer parens around the predicate / inside the
+        # expression) rather than merely dropping the schema qualifier.
+        # Folded into the same helper so the existing byte-equality
+        # assertion covers them for free.
+        conn.execute(f"""
+            CREATE INDEX ix_gadgets_active ON {s}.gadgets (widget_id) WHERE status = 'active';
+            CREATE INDEX ix_gadgets_email_status ON {s}.gadgets ((email || status));
+        """)
 
 
 def test_snapshot_of_identically_defined_schemas_is_byte_equal_with_no_normalisation(conn, fresh_schema):
@@ -207,3 +221,51 @@ def test_index_and_constraint_definitions_have_no_schema_qualifier(conn, fresh_s
             assert fresh_schema not in idx.definition, idx.definition
         for con in table.constraints.values():
             assert fresh_schema not in con.definition, con.definition
+
+
+def test_partial_and_expression_index_definitions_round_trip_stably(conn, fresh_schema):
+    # RULING R17(2): pg_get_indexdef's pretty=true form doesn't just drop
+    # the schema qualifier for a partial or expression index -- it also
+    # deterministically strips the outer parens around a partial index's
+    # predicate and a redundant paren layer inside an expression index. A
+    # human verified by hand that this rewrite is a stable fixed point
+    # (recreating the index from the rewritten text and re-introspecting
+    # reproduces the same text); that must not remain a probe someone ran
+    # once. Introspect an index, execute its own stored `definition` text
+    # to recreate an equivalent index in a second, throwaway schema (under
+    # the same search_path discipline `snapshot()` itself uses, since the
+    # stored text is unqualified), re-introspect, and assert the two
+    # definition strings are byte-identical -- proving both that the
+    # stored text is executable DDL and that executing it round-trips.
+    schema_x = fresh_schema
+    _build_two_table_schema(conn, schema_x, "integer", "text", "timestamptz", "now()")
+    original = snapshot(conn, schema_x).tables["gadgets"].indexes
+    partial_def = original["ix_gadgets_active"].definition
+    expr_def = original["ix_gadgets_email_status"].definition
+    # Confirm this test is actually exercising the rewrite pretty=true
+    # performs -- outer parens dropped around the predicate, and one
+    # redundant paren layer dropped inside the expression (the mandatory
+    # syntactic paren around an expression-index column stays, so
+    # "(((email || status)))" becomes "((email || status))", not
+    # "(email || status)") -- not merely comparing two copies of text that
+    # was never rewritten in the first place.
+    assert "WHERE (status" not in partial_def
+    assert "(((email" not in expr_def
+
+    schema_y = "t_" + uuid.uuid4().hex[:12]
+    conn.execute(f'CREATE SCHEMA "{schema_y}"')
+    try:
+        # Same underlying table shape, but without the two indexes under
+        # test -- they get recreated below straight from the stored
+        # definition text.
+        _build_two_table_schema(conn, f'"{schema_y}"', "integer", "text",
+                                 "timestamptz", "now()", extra_indexes=False)
+        with conn.transaction():
+            conn.execute(sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(schema_y)))
+            conn.execute(partial_def)
+            conn.execute(expr_def)
+        rebuilt = snapshot(conn, schema_y).tables["gadgets"].indexes
+        assert rebuilt["ix_gadgets_active"].definition == partial_def
+        assert rebuilt["ix_gadgets_email_status"].definition == expr_def
+    finally:
+        conn.execute(f'DROP SCHEMA "{schema_y}" CASCADE')
