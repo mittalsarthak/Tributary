@@ -150,41 +150,60 @@ def test_snapshot_is_byte_stable_across_repeated_introspection(conn, fresh_schem
     assert first == second
 
 
-def test_snapshot_normalises_type_spelling_across_schemas(conn, fresh_schema):
-    # RULING R11(2) -- the property that actually matters: two schemas that
-    # are identically defined but spell their types differently must produce
-    # equal snapshots once the (necessarily different, randomly-generated)
-    # schema names are normalised out. Spelling differences must not survive
-    # into the snapshot.
+def _build_two_table_schema(conn, s, id_type, str_type, ts_type, ts_default):
+    # A table, a standalone index, a unique constraint, and a foreign key to
+    # a second table -- every place a schema-qualified definition (via
+    # pg_get_indexdef / pg_get_constraintdef) could leak the source schema
+    # name into the snapshot.
+    conn.execute(f"""
+        CREATE TABLE {s}.widgets (id {id_type} PRIMARY KEY);
+        CREATE TABLE {s}.gadgets (
+          id {id_type} PRIMARY KEY,
+          widget_id {id_type} REFERENCES {s}.widgets(id),
+          email {str_type} NOT NULL,
+          created_at {ts_type} DEFAULT {ts_default},
+          CONSTRAINT gadgets_email_key UNIQUE (email)
+        );
+        CREATE UNIQUE INDEX ix_gadgets_widget_id ON {s}.gadgets (widget_id);
+    """)
+
+
+def test_snapshot_of_identically_defined_schemas_is_byte_equal_with_no_normalisation(conn, fresh_schema):
+    # RULING R14(3): replaces R11(2)'s schema-name normalisation -- which
+    # was masking the real defect -- with the actual property. Two
+    # separately-created schemas, identically defined (down to a standalone
+    # index, a unique constraint, and a foreign key to a second table),
+    # spelled with different type/default spellings, must produce
+    # byte-identical snapshot JSON with NO normalisation of any kind,
+    # schema name included. If they don't, diff is broken: every branch
+    # would show every index and FK as "modified" purely because of the
+    # schema name, and merge would report conflicts on all of them.
     schema_a = fresh_schema
     schema_b = "t_" + uuid.uuid4().hex[:12]
     conn.execute(f'CREATE SCHEMA "{schema_b}"')
     try:
-        conn.execute(f"""
-            CREATE TABLE {schema_a}.users (
-              id integer PRIMARY KEY,
-              email character varying(255) NOT NULL,
-              age integer,
-              created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE UNIQUE INDEX ix_users_email ON {schema_a}.users (email);
-        """)
-        conn.execute(f"""
-            CREATE TABLE "{schema_b}".users (
-              id int4 PRIMARY KEY,
-              email varchar(255) NOT NULL,
-              age int4,
-              created_at timestamptz DEFAULT now()
-            );
-            CREATE UNIQUE INDEX ix_users_email ON "{schema_b}".users (email);
-        """)
+        _build_two_table_schema(conn, schema_a, "integer", "character varying(255)",
+                                 "timestamp with time zone", "CURRENT_TIMESTAMP")
+        _build_two_table_schema(conn, f'"{schema_b}"', "int4", "varchar(255)",
+                                 "timestamptz", "now()")
         json_a = json.dumps(snapshot(conn, schema_a).to_json(), sort_keys=False)
         json_b = json.dumps(snapshot(conn, schema_b).to_json(), sort_keys=False)
-        # The only difference allowed to survive is the schema name itself
-        # (it leaks into index/default definitions via pg_get_indexdef /
-        # pg_get_expr) -- normalise it away before comparing.
-        json_a = json_a.replace(schema_a, "SCHEMA")
-        json_b = json_b.replace(schema_b, "SCHEMA")
         assert json_a == json_b
     finally:
         conn.execute(f'DROP SCHEMA "{schema_b}" CASCADE')
+
+
+def test_index_and_constraint_definitions_have_no_schema_qualifier(conn, fresh_schema):
+    # RULING R14(4): pg_get_indexdef / pg_get_constraintdef must not embed
+    # the schema name at all. If they did, replaying these definitions to
+    # materialise a branch (Task 6/9) would create the object in the
+    # SOURCE schema instead of the branch -- a branch operation silently
+    # mutating the schema it branched from.
+    _build_two_table_schema(conn, fresh_schema, "integer", "text",
+                             "timestamptz", "now()")
+    snap = snapshot(conn, fresh_schema)
+    for table in snap.tables.values():
+        for idx in table.indexes.values():
+            assert fresh_schema not in idx.definition, idx.definition
+        for con in table.constraints.values():
+            assert fresh_schema not in con.definition, con.definition
