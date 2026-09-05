@@ -1,0 +1,17 @@
+.venv
+.git
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+tests
+bench
+docs
+.superpowers
+.idea
+*.egg-info
+.ruff_cache
+.DS_Store
+Dockerfile
+.dockerignore
+docker-compose.yml
