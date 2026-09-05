@@ -2,6 +2,7 @@ import os
 import uuid
 import pytest
 import psycopg
+from psycopg import sql
 
 from tributary import store
 
@@ -49,4 +50,4 @@ def ws(conn):
     conn.execute("DROP SCHEMA IF EXISTS _tributary CASCADE")
     for (s,) in conn.execute("SELECT nspname FROM pg_namespace "
                               "WHERE nspname LIKE 'br\\_%'").fetchall():
-        conn.execute(f'DROP SCHEMA "{s}" CASCADE')
+        conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(s)))

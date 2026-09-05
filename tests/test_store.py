@@ -60,6 +60,49 @@ def test_branch_inherits_base_commit_from_parent_head(ws):
     assert b.base_commit == store.head(ws, "main").id
 
 
+# --- R3: ensure_main must be idempotent, and that guarantee needs a test ----
+#
+# The `ws` fixture already calls `store.ensure_main(conn)` once at setup; this
+# test calls it again and checks that the second call left no trace -- no
+# second `main` branch row, and no new commit (HEAD unchanged). Without a
+# regression test for this, a future refactor of the check-then-act logic
+# could silently reintroduce a duplicate-registration bug.
+
+def test_ensure_main_is_idempotent(ws):
+    first = store.ensure_main(ws)
+    second = store.ensure_main(ws)
+
+    main_branches = [b for b in store.list_branches(ws) if b.name == "main"]
+    assert len(main_branches) == 1
+    assert first.head_commit == second.head_commit
+
+
+# --- delete_branch ------------------------------------------------------------
+
+def test_delete_branch_removes_the_branch_row_and_its_schema(ws):
+    b = store.create_branch(ws, "throwaway")
+    store.delete_branch(ws, "throwaway")
+
+    assert all(branch.name != "throwaway" for branch in store.list_branches(ws))
+    (schema_exists,) = ws.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s)",
+        (b.schema_name,),
+    ).fetchone()
+    assert schema_exists is False
+
+
+def test_delete_branch_refuses_to_delete_main(ws):
+    with pytest.raises(ValueError):
+        store.delete_branch(ws, "main")
+
+    main_branches = [b for b in store.list_branches(ws) if b.name == "main"]
+    assert len(main_branches) == 1
+    (schema_exists,) = ws.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'main')"
+    ).fetchone()
+    assert schema_exists is True
+
+
 # --- R15: the mandatory test -------------------------------------------------
 #
 # Materialising a branch that silently wrote its objects into `main` instead
