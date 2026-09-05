@@ -1,4 +1,5 @@
 import os
+
 import psycopg
 
 DEFAULT_DSN = "postgresql://tributary:tributary@localhost:5433/tributary"
