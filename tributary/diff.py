@@ -296,7 +296,18 @@ def _diff_columns(
         # name -- by the time an ALTER COLUMN runs, RENAME COLUMN (ordered
         # ahead of it, see module docstring) has already retargeted it.
         if old_c.type != new_c.type:
-            changes.append(AlterColumnType(new_table, new_col, old_c.type, new_c.type))
+            # R20: carry the *target* column's nullable/default onto the
+            # change itself. A rewriting retype (planner.py's shadow-column
+            # dance) drops the original column and renames a plain new one
+            # into its place, which loses NOT NULL/DEFAULT unless something
+            # tells it to restore them -- and when nullability/default did
+            # not themselves change, no separate SetNotNull/SetDefault
+            # change exists to carry that information. Without this, a
+            # retype-only commit on an already-NOT-NULL-DEFAULT column would
+            # silently drop both, and the *next* diff would then emit a
+            # SetNotNull to repair damage this diff caused.
+            changes.append(AlterColumnType(new_table, new_col, old_c.type, new_c.type,
+                                            nullable=new_c.nullable, default=new_c.default))
 
         if old_c.nullable and not new_c.nullable:
             changes.append(SetNotNull(new_table, new_col))

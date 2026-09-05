@@ -190,6 +190,16 @@ class AlterColumnType:
     column: str
     old_type: str
     new_type: str
+    # R20: the *target* column's nullability/default, so a rewriting retype's
+    # shadow-column swap (tributary/planner.py) can restore what a plain
+    # ALTER never loses in the first place. Both optional and trailing so
+    # every existing 4-positional-arg construction (every test predating this
+    # ruling) still works unchanged. `None` means "not supplied" -- distinct
+    # from `nullable=True`/`default=None`, which are real target states -- so
+    # the planner only attempts a restoration when a caller (diff.py) actually
+    # populated one.
+    nullable: bool | None = None
+    default: str | None = None
 
 
 @dataclass(frozen=True)

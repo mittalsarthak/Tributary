@@ -98,7 +98,14 @@ def test_set_not_null_uses_a_validated_check_to_skip_the_scan():
 
 
 def test_rewriting_retype_becomes_a_shadow_column_backfill():
-    p = plan([AlterColumnType("events", "id", "int4", "int8")], BIG, "main")
+    # R19: plan() now needs to know the table's primary key to emit a fully
+    # resolved batched backfill (no {pk}-style placeholder in Step.sql, see
+    # the R19 tests below) -- pk_columns is new surface added by that
+    # ruling, after this test was originally written, so it is supplied here
+    # to keep exercising the full shadow-column dance rather than the
+    # no-known-PK fallback. Every original assertion below is unchanged.
+    p = plan([AlterColumnType("events", "id", "int4", "int8")], BIG, "main",
+             pk_columns={"events": "id"})
     kinds = [s.kind for s in p.steps]
     assert "backfill" in kinds and "swap" in kinds
     joined = " | ".join(sqls(p))
@@ -132,7 +139,8 @@ def test_every_ddl_step_is_preceded_by_a_lock_timeout():
 
 
 def test_plan_warns_about_the_expensive_table_in_human_words():
-    p = plan([AlterColumnType("events", "id", "int4", "int8")], BIG, "main")
+    p = plan([AlterColumnType("events", "id", "int4", "int8")], BIG, "main",
+             pk_columns={"events": "id"})
     assert p.warnings
     joined = " ".join(p.warnings).lower()
     assert "events" in joined and ("gb" in joined or "rewrit" in joined)
@@ -152,9 +160,117 @@ def test_never_analysed_large_table_still_takes_the_safe_path():
     c = AlterColumnType("events", "id", "int4", "int8")
     assert classify(c, never_analysed_big["events"]) == Safety.REWRITE
 
-    p = plan([c], never_analysed_big, "main")
+    p = plan([c], never_analysed_big, "main", pk_columns={"events": "id"})
     kinds = [s.kind for s in p.steps]
     assert "backfill" in kinds and "swap" in kinds
+
+
+# --- R19: eliminate the {pk} placeholder entirely ---------------------------
+
+def test_known_pk_produces_a_fully_resolved_backfill_with_no_placeholder():
+    c = AlterColumnType("events", "id", "int4", "int8")
+    p = plan([c], BIG, "main", pk_columns={"events": "id"})
+    backfill = next(s for s in p.steps if s.kind == "backfill")
+    assert "{" not in backfill.sql
+    assert '"id"' in backfill.sql
+
+
+def test_missing_pk_falls_back_to_plain_alter_with_a_warning_instead_of_a_placeholder():
+    c = AlterColumnType("events", "id", "int4", "int8")
+    p = plan([c], BIG, "main")  # no pk_columns at all
+    assert not any(s.kind == "backfill" for s in p.steps)
+    assert not any(s.kind == "swap" for s in p.steps)
+    assert not any("{" in s.sql for s in p.steps)
+    joined = " ".join(p.warnings).lower()
+    assert "events" in joined and "primary key" in joined
+
+
+def test_table_absent_from_pk_columns_also_falls_back_conservatively():
+    c = AlterColumnType("events", "id", "int4", "int8")
+    # pk_columns is supplied but doesn't mention "events" -- same as absent.
+    p = plan([c], BIG, "main", pk_columns={"other_table": "id"})
+    assert not any(s.kind == "backfill" for s in p.steps)
+    assert not any("{" in s.sql for s in p.steps)
+
+
+def test_no_step_sql_ever_contains_an_unresolved_placeholder():
+    changes = [
+        AlterColumnType("events", "id", "int4", "int8"),          # PK known
+        AlterColumnType("orders", "amount", "int4", "numeric"),    # PK unknown
+    ]
+    stats = {
+        "events": TableStats(rows=52_000_000, bytes=5_200_000_000),
+        "orders": TableStats(rows=10_000_000, bytes=2_000_000_000),
+    }
+    p = plan(changes, stats, "main", pk_columns={"events": "id"})
+    assert not any("{" in s.sql for s in p.steps)
+
+
+# --- R20: the shadow-column swap must restore NOT NULL/DEFAULT --------------
+
+def test_shadow_dance_restores_not_null_and_default():
+    c = AlterColumnType("events", "id", "int4", "int8", nullable=False, default="0")
+    p = plan([c], BIG, "main", pk_columns={"events": "id"})
+    joined = " | ".join(sqls(p))
+    assert "SET NOT NULL" in joined
+    assert "SET DEFAULT" in joined
+    # restored on the shadow column, validated before the swap so the swap's
+    # own SET NOT NULL is metadata-only rather than a fresh scan under lock
+    assert any("NOT VALID" in s and "trib_new" in s for s in sqls(p))
+    swap = next(s for s in p.steps if s.kind == "swap")
+    assert "SET NOT NULL" in swap.sql
+    assert "SET DEFAULT" in swap.sql
+
+
+def test_plain_alter_path_never_needed_to_restore_anything():
+    # A plain ALTER COLUMN TYPE never drops NOT NULL/DEFAULT in the first
+    # place -- it's the same physical column throughout -- so nullable/
+    # default on the change must not trigger any extra SET NOT NULL/SET
+    # DEFAULT step on either the binary-coercible or small-table path.
+    coercible = AlterColumnType("events", "name", "varchar(50)", "varchar(100)",
+                                 nullable=False, default="'x'")
+    p1 = plan([coercible], BIG, "main")
+    assert not any("SET NOT NULL" in s for s in sqls(p1))
+    assert not any("SET DEFAULT" in s for s in sqls(p1))
+
+    small = {"events": TableStats(rows=200, bytes=16_384)}
+    non_coercible_small = AlterColumnType("events", "id", "int4", "int8",
+                                           nullable=False, default="0")
+    p2 = plan([non_coercible_small], small, "main")
+    assert not any("SET NOT NULL" in s for s in sqls(p2))
+    assert not any("SET DEFAULT" in s for s in sqls(p2))
+
+
+# --- R21: PRIMARY KEY/UNIQUE on a large table use the concurrent-index pattern
+
+def test_large_table_unique_constraint_builds_concurrently_then_adopts_it():
+    c = AddConstraint("events", Constraint("uq_email", "u", "UNIQUE (email)", ("email",)))
+    p = plan([c], BIG, "main")
+    idx_step = next(s for s in p.steps if s.kind == "index_concurrent")
+    assert "CONCURRENTLY" in idx_step.sql
+    assert idx_step.transactional is False
+    assert any("USING INDEX" in s and "UNIQUE" in s for s in sqls(p))
+
+
+def test_small_table_unique_constraint_stays_a_single_plain_add_constraint():
+    small = {"events": TableStats(rows=200, bytes=16_384)}
+    c = AddConstraint("events", Constraint("uq_email", "u", "UNIQUE (email)", ("email",)))
+    p = plan([c], small, "main")
+    assert not any(s.kind == "index_concurrent" for s in p.steps)
+    assert len([s for s in p.steps if s.kind == "ddl"]) == 1
+    assert any("ADD CONSTRAINT" in s and "UNIQUE" in s for s in sqls(p))
+
+
+def test_large_table_primary_key_establishes_not_null_before_adopting_the_index():
+    c = AddConstraint("events", Constraint("pk_events", "p", "PRIMARY KEY (id)", ("id",)))
+    p = plan([c], BIG, "main")
+    order = sqls(p)
+    set_nn_at = next(i for i, s in enumerate(order) if "SET NOT NULL" in s)
+    using_idx_at = next(i for i, s in enumerate(order)
+                        if "USING INDEX" in s and "PRIMARY KEY" in s)
+    assert set_nn_at < using_idx_at
+    idx_step = next(s for s in p.steps if s.kind == "index_concurrent")
+    assert idx_step.transactional is False
 
 
 # --- Step 3: ordering and preflight ------------------------------------------

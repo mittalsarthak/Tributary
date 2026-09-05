@@ -66,7 +66,13 @@ def test_unrelated_drop_and_add_of_different_types_is_not_a_rename():
 def test_type_change_is_detected():
     a = Snapshot({"users": tbl("users", id="int4")})
     b = Snapshot({"users": tbl("users", id="int8")})
-    assert diff(a, b) == [AlterColumnType("users", "id", "int4", "int8")]
+    # R20: AlterColumnType now carries the *target* column's nullable/default
+    # (both True/None here, since tbl() builds nullable columns with no
+    # default) so a rewriting retype's shadow-column swap knows what to
+    # restore. tbl()'s columns are always nullable=True, default=None.
+    assert diff(a, b) == [
+        AlterColumnType("users", "id", "int4", "int8", nullable=True, default=None)
+    ]
 
 
 def test_canonically_equal_types_produce_no_diff():
@@ -122,9 +128,12 @@ def test_rename_plus_retype_in_the_same_commit_needs_the_op_log_not_just_the_heu
     assert not any(isinstance(c, RenameColumn) for c in without_ops)
 
     with_ops = diff(a, b, ops)
+    # R20: AlterColumnType carries the target column's nullable/default
+    # (nullable=True, default=None, per tbl()'s always-nullable columns).
     assert with_ops == [
         RenameColumn("users", "email", "email_address"),
-        AlterColumnType("users", "email_address", "text", "varchar(255)"),
+        AlterColumnType("users", "email_address", "text", "varchar(255)",
+                         nullable=True, default=None),
     ]
 
 

@@ -33,6 +33,19 @@ Rewrites, and why each is necessary (see the task brief for the full table):
   full-table scan out from under `ACCESS EXCLUSIVE`; `VALIDATE CONSTRAINT`
   only needs `SHARE UPDATE EXCLUSIVE`, so reads and writes continue while it
   runs.
+- `ADD PRIMARY KEY` / `ADD UNIQUE`, on a large table (R21) -> build the
+  backing index with `CREATE UNIQUE INDEX CONCURRENTLY` (which does not
+  block writes), then adopt it with `ADD CONSTRAINT ... USING INDEX`, which
+  only holds `ACCESS EXCLUSIVE` long enough to update the catalog, not for
+  the whole index build. A primary key additionally requires every key
+  column to already be `NOT NULL` (Postgres would otherwise do its own
+  null-check scan under the adoption's exclusive lock, defeating the
+  point), so that is established first, per column, via the same
+  `NOT VALID` CHECK / `VALIDATE` / `SET NOT NULL` sequence `SetNotNull`
+  uses (`_not_null_steps`). Below the size threshold, both fall back to a
+  single plain `ADD CONSTRAINT` -- Postgres has no `NOT VALID` form for
+  either, so there is nothing cheaper to defer on a table small enough that
+  the direct validation is fast anyway.
 - `CREATE INDEX` -> `CREATE INDEX CONCURRENTLY`, run standalone (never
   combined into the same query string as the `SET lock_timeout` that
   precedes it -- Postgres wraps a multi-statement simple-query string in an
@@ -46,31 +59,63 @@ Rewrites, and why each is necessary (see the task brief for the full table):
   `VALIDATE CONSTRAINT`, then `SET NOT NULL` (PG12+ uses the already
   validated check to skip its own scan) and finally `DROP CONSTRAINT` on the
   now-redundant scaffold.
-- `ALTER COLUMN TYPE`, binary-incoercible, on a large table -> the
-  shadow-column dance (see `_shadow_dance`). On a small table, a plain
-  `ALTER` is cheaper than the dance it would otherwise avoid (see
-  `_is_large`'s thresholds).
+- `ALTER COLUMN TYPE`, binary-incoercible, on a large table, with a known
+  primary key (see `pk_columns` below) -> the shadow-column dance (see
+  `_shadow_dance`). With no usable primary key, see R19 below -- there is no
+  safe batched path, and this module says so rather than pretending
+  otherwise. On a small table, a plain `ALTER` is cheaper than the dance it
+  would otherwise avoid (see `_is_large`'s thresholds).
 - `ALTER COLUMN TYPE`, binary-coercible (`is_binary_coercible`) -> a plain
   `ALTER`, regardless of table size, since nothing needs validating.
 
-Known interface gap, flagged rather than papered over: the shadow-column
-backfill step's SQL is a *template* containing the placeholder `{pk}` for
-the table's real primary-key column identifier. This module is pure logic
--- it is handed `Change`s and measured `TableStats`, and deliberately opens
-no database connection -- so it cannot resolve which column is the primary
-key. The executor (Task 9) does hold a live connection and must substitute
-`{pk}` with the table's actual (quoted) primary-key column before running
-each batch; `%(cursor)s` and `%(batch_size)s` are real psycopg bind
-parameters, not template placeholders, re-supplied every iteration from the
-last committed `cursor_val` and the configured `batch_size`.
+R19 -- no unresolved placeholders in emitted SQL, ever. An earlier version
+of this module put a literal `{pk}` token in the batched backfill's SQL,
+intending for Task 9's executor to substitute the table's real primary-key
+column before running it. That is indistinguishable, by inspection of
+`Step.sql` alone, from a real, runnable statement -- the only thing standing
+between it and a malformed query against production was the next person
+remembering an unwritten contract. `plan()` now takes `pk_columns:
+dict[str, str] | None`, mapping table name to its (single-column) primary
+key, which a caller derives from its own `Snapshot` (a `Constraint` with
+`kind == "p"` and one column). When the retyped table's primary key is
+known, the backfill's SQL is fully resolved -- no placeholder text appears
+anywhere in it. When it is not (table absent from `pk_columns`, or
+`pk_columns` not supplied at all) *and* the table is large, this module
+does not fabricate a batched plan it cannot actually make safe: a table
+genuinely cannot be paged through by primary-key range without one. Instead
+it falls back to a single plain `ALTER` (the same statement the naive
+planner this project exists to replace would have emitted) and attaches a
+warning explaining exactly why the safe path was unavailable, so a human
+sees the tradeoff before committing rather than discovering it as an
+unexplained outage. `test_no_step_sql_ever_contains_an_unresolved_placeholder`
+is the regression guard for this.
 
-Also flagged rather than silently done wrong: the swap step at the end of
-the shadow-column dance does not restore `NOT NULL`/`DEFAULT` on the
-retyped column, because `AlterColumnType` (table, column, old_type,
-new_type) does not carry the original column's nullability or default --
-that information simply is not part of this module's input. A caller that
-needs a NOT NULL or DEFAULT preserved across a rewriting retype must emit
-`SetNotNull`/`SetDefault` as additional changes in the same commit.
+Composite primary keys are out of scope for `pk_columns`'s `dict[str, str]`
+shape (one column name, not a tuple) -- a caller with a composite-keyed
+table should simply omit it from the map, which correctly routes it through
+the same conservative no-PK path (there is no single column to batch-range
+over regardless).
+
+R20 -- the shadow-column swap must restore what it silently drops. A plain
+`ALTER COLUMN ... TYPE` never touches a column's `NOT NULL`/`DEFAULT` --
+it's the same physical column throughout. The shadow-column dance is
+different: it creates a brand new (plain, nullable, default-less) column
+and drops the old one, so if the retyped column was `NOT NULL DEFAULT 0`
+and *stays* that way (only its type changes), `diff.py` emits a bare
+`AlterColumnType` with no accompanying `SetNotNull`/`SetDefault` -- nothing
+else in the change list would ever restore them. Worse than a cosmetic gap:
+the very next diff would see the missing `NOT NULL` and emit a `SetNotNull`
+to repair damage this migration caused, on a table already large enough
+that the repair is itself expensive. `AlterColumnType.nullable`/`.default`
+(populated by `diff.py` from the *target* column) tell `_shadow_dance` what
+to restore. Restoring `NOT NULL` inside the swap's own short transaction
+would force Postgres to scan the (already-populated) shadow column under
+that transaction's `ACCESS EXCLUSIVE` lock, extending exactly the lock
+window the whole dance exists to keep short -- so, mirroring `SetNotNull`'s
+own trick, a scaffolding `CHECK` is validated on the shadow column *before*
+the swap begins, and the swap's `SET NOT NULL` only pays for a catalog
+update. `DEFAULT` costs nothing to restore either way (it only affects
+future inserts), so it is set directly in the swap.
 
 Ordering is topological by change *type*, not by input order: `diff.py`
 already returns changes in a sane default bucket order, but this module is
@@ -82,7 +127,12 @@ phase is stable-sorted internally so within-table ordering already
 established upstream (e.g. `RenameColumn` before the `AlterColumnType` that
 follows it) survives. This one rule also naturally gets the drop+create
 same-named-index case right: `DropIndex` is phase 0, `CreateIndex` is phase
-4, so the drop always precedes the create regardless of input order.
+4, so the drop always precedes the create regardless of input order. Note
+that the primary-key-adoption ordering R21 requires (`NOT NULL` established
+before the index is adopted) is entirely *intra*-emission -- it is just the
+order `_S` tuples are appended within `_emit_add_constraint` for a single
+`AddConstraint` change -- so it does not interact with (or need to be
+wedged into) this change-level topological sort at all.
 
 `Change`/`Table`/`Snapshot` carry `dict` fields and are unhashable at
 runtime despite being frozen dataclasses -- nothing in this module puts one
@@ -140,6 +190,14 @@ def _is_large(stats: TableStats | None) -> bool:
     if stats.rows is not None and stats.rows >= _LARGE_ROWS:
         return True
     return stats.bytes >= _LARGE_BYTES
+
+
+def _size_desc(st: TableStats | None) -> str:
+    if st is None:
+        return "size unknown (never measured)"
+    size_gb = st.bytes / (1024**3)
+    rows_desc = f"{st.rows:,} rows" if st.rows is not None else "an unknown row count (never analysed)"
+    return f"{size_gb:.1f}GB, {rows_desc}"
 
 
 # --- binary coercibility ------------------------------------------------------
@@ -297,6 +355,18 @@ class _S(NamedTuple):
     est_bytes: int | None = None
 
 
+def _lock_timeout_step(lock_timeout: str, table: str | None, est_rows: int | None,
+                        est_bytes: int | None, note: str) -> _S:
+    """A standalone `SET lock_timeout`, its own step -- never combined into
+    the same query string as the `CREATE INDEX CONCURRENTLY` (or similar)
+    statement that follows it. Postgres wraps a multi-statement simple-query
+    string in an implicit transaction block, and `CONCURRENTLY` operations
+    fail outright inside any transaction, so the two must be sent as
+    separate queries even though both run with `transactional=False`.
+    """
+    return _S(_lt(lock_timeout), "ddl", Safety.LOCK_HEAVY, False, note, table, est_rows, est_bytes)
+
+
 # --- ordering ----------------------------------------------------------------
 
 _PHASE = {
@@ -346,21 +416,21 @@ def _table_name(change: Change) -> str | None:
 # --- warnings ------------------------------------------------------------------
 
 def _warn_rewrite(table: str, st: TableStats | None) -> str:
-    if st is not None:
-        size_gb = st.bytes / (1024**3)
-        rows_desc = (
-            f"{st.rows:,} rows" if st.rows is not None else "an unknown row count (never analysed)"
-        )
-        return (
-            f"{table} is {size_gb:.1f}GB ({rows_desc}) -- retyping this column will be "
-            f"rewritten as a shadow-column backfill instead of a naive ALTER TABLE, to avoid "
-            f"an ACCESS EXCLUSIVE rewrite of the whole table. This migration will take longer "
-            f"than a plain ALTER, but {table} stays readable and writable the entire time."
-        )
     return (
-        f"{table}'s size could not be measured, so it is being treated as large out of "
-        f"caution: retyping this column will go through a shadow-column backfill rather than "
-        f"a naive ALTER TABLE."
+        f"{table} is {_size_desc(st)} -- retyping this column will be rewritten as a "
+        f"shadow-column backfill instead of a naive ALTER TABLE, to avoid an ACCESS "
+        f"EXCLUSIVE rewrite of the whole table. This migration will take longer than a "
+        f"plain ALTER, but {table} stays readable and writable the entire time."
+    )
+
+
+def _warn_no_pk_fallback(table: str, st: TableStats | None) -> str:
+    return (
+        f"{table} ({_size_desc(st)}) has no primary key Tributary can use for a safe "
+        f"batched backfill, so this retype will run as a single ALTER TABLE under an "
+        f"ACCESS EXCLUSIVE lock for however long the full rewrite takes -- there is no "
+        f"way to page through the table's rows safely without one. Add a primary key to "
+        f"{table} before running this migration, or schedule it for a maintenance window."
     )
 
 
@@ -372,6 +442,49 @@ def _emit_plain(change: Change, schema: str, lock_timeout: str, safety: Safety,
     stmt = render(change, schema)
     return [_S(f"{_lt(lock_timeout)};\n{stmt}", "ddl", safety, True, note,
                 table, est_rows, est_bytes)]
+
+
+def _not_null_steps(table: str, column: str, schema: str, lock_timeout: str,
+                     st: TableStats | None) -> list[_S]:
+    """The full `NOT VALID` CHECK -> `VALIDATE` -> `SET NOT NULL` -> `DROP`
+    scaffold sequence. Shared by `SetNotNull`'s own rewrite and by the
+    `PRIMARY KEY USING INDEX` pattern (R21), which requires every key
+    column to already be `NOT NULL` before the index can be adopted without
+    Postgres redoing that check itself under the adoption's exclusive lock.
+    """
+    qualified = _qualified(schema, table)
+    col = _ident(column)
+    scaffold = _ident(f"{column}_trib_notnull")
+    est_rows = st.rows if st else None
+    est_bytes = st.bytes if st else None
+    probe = f"SELECT count(*) FROM {qualified} WHERE {col} IS NULL"
+    return [
+        _S(probe, "preflight", Safety.LOCK_HEAVY, True,
+           "cheap probe for existing NULLs before touching any lock; a nonzero count here "
+           "means SET NOT NULL would fail outright and the migration should abort here",
+           table, est_rows, est_bytes),
+        _S(f"{_lt(lock_timeout)};\nALTER TABLE {qualified} ADD CONSTRAINT {scaffold} "
+           f"CHECK ({col} IS NOT NULL) NOT VALID", "ddl", Safety.LOCK_HEAVY, True,
+           "scaffolding CHECK, added NOT VALID so no scan happens yet",
+           table, est_rows, est_bytes),
+        _S(f"ALTER TABLE {qualified} VALIDATE CONSTRAINT {scaffold}", "validate",
+           Safety.LOCK_HEAVY, True,
+           "validates the scaffolding CHECK under SHARE UPDATE EXCLUSIVE, not ACCESS EXCLUSIVE",
+           table, est_rows, est_bytes),
+        _S(f"{_lt(lock_timeout)};\nALTER TABLE {qualified} ALTER COLUMN {col} SET NOT NULL",
+           "ddl", Safety.LOCK_HEAVY, True,
+           "PG12+ uses the already-validated CHECK to skip its own full-table scan",
+           table, est_rows, est_bytes),
+        _S(f"{_lt(lock_timeout)};\nALTER TABLE {qualified} DROP CONSTRAINT {scaffold}",
+           "ddl", Safety.LOCK_HEAVY, True,
+           "scaffolding CHECK is now redundant with the real NOT NULL and is removed",
+           table, est_rows, est_bytes),
+    ]
+
+
+def _emit_set_not_null(change: SetNotNull, schema: str, lock_timeout: str,
+                        st: TableStats | None) -> tuple[list[_S], list[str]]:
+    return _not_null_steps(change.table, change.column, schema, lock_timeout, st), []
 
 
 def _emit_add_constraint(change: AddConstraint, schema: str, lock_timeout: str,
@@ -397,53 +510,51 @@ def _emit_add_constraint(change: AddConstraint, schema: str, lock_timeout: str,
                table, est_rows, est_bytes),
         ], []
 
-    # PRIMARY KEY / UNIQUE: Postgres has no NOT VALID form for these -- adding
-    # one always validates (and, for a new one, builds an index over) every
-    # row. Known limitation, flagged rather than silently accepted: a fuller
-    # implementation would build the backing index with CREATE UNIQUE INDEX
-    # CONCURRENTLY first and then ADD CONSTRAINT ... UNIQUE USING INDEX, but
-    # neither the brief nor its tests exercise that path, so it is left as a
-    # plain (still lock_timeout-guarded) ADD CONSTRAINT.
+    if con.kind in ("p", "u") and _is_large(st):
+        # R21: PRIMARY KEY/UNIQUE build their backing index under ACCESS
+        # EXCLUSIVE if added directly -- the whole table is blocked for the
+        # build, exactly the outage this module exists to avoid. Build the
+        # index CONCURRENTLY (does not block writes), then adopt it as the
+        # constraint; the adoption only holds ACCESS EXCLUSIVE long enough
+        # to update the catalog, not for the build itself.
+        steps: list[_S] = []
+        if con.kind == "p":
+            # PRIMARY KEY USING INDEX requires every key column to already
+            # be NOT NULL, or Postgres does its own null-check scan under
+            # the adoption's exclusive lock, defeating the point. Established
+            # first, per column, via the same safe sequence SetNotNull uses.
+            for column in con.columns:
+                steps.extend(_not_null_steps(table, column, schema, lock_timeout, st))
+
+        idx_ident = _ident(f"{con.name}_trib_build")
+        cols_sql = ", ".join(_ident(c) for c in con.columns)
+        steps.append(_lock_timeout_step(lock_timeout, table, est_rows, est_bytes,
+            "set standalone -- combining this with CREATE INDEX CONCURRENTLY in one query "
+            "string would implicitly wrap both in a transaction, and CIC cannot run in one"))
+        steps.append(_S(f"CREATE UNIQUE INDEX CONCURRENTLY {idx_ident} ON {qualified} ({cols_sql})",
+            "index_concurrent", Safety.LOCK_HEAVY, False,
+            "builds the backing index without holding ACCESS EXCLUSIVE for the whole build; "
+            "must run outside any transaction. A cancelled run leaves an INVALID index "
+            "behind -- Task 9's executor cleans that up on failure",
+            table, est_rows, est_bytes))
+        adopt_kind = "PRIMARY KEY" if con.kind == "p" else "UNIQUE"
+        steps.append(_S(
+            f"{_lt(lock_timeout)};\nALTER TABLE {qualified} ADD CONSTRAINT {name_ident} "
+            f"{adopt_kind} USING INDEX {idx_ident}", "ddl", Safety.LOCK_HEAVY, True,
+            "adopts the already-built index as the constraint; ACCESS EXCLUSIVE is held "
+            "only long enough to update the catalog, not to build the index",
+            table, est_rows, est_bytes))
+        return steps, []
+
+    # Small table, or a constraint kind with no CONCURRENTLY-index
+    # equivalent: a direct validation (and, for p/u, index build) is cheap
+    # enough here that there is nothing worth deferring.
     stmt = f"ALTER TABLE {qualified} ADD CONSTRAINT {name_ident} {con.definition}"
-    return [_S(f"{_lt(lock_timeout)};\n{stmt}", "ddl", Safety.LOCK_HEAVY, True,
-                "primary key/unique constraints have no NOT VALID form in Postgres; this "
-                "still takes ACCESS EXCLUSIVE for the full validation (and index build)",
+    note = ("primary key/unique constraints have no NOT VALID form in Postgres, but the "
+            "table is small enough that a direct ACCESS EXCLUSIVE validation is cheap"
+            if con.kind in ("p", "u") else "plain constraint add")
+    return [_S(f"{_lt(lock_timeout)};\n{stmt}", "ddl", Safety.LOCK_HEAVY, True, note,
                 table, est_rows, est_bytes)], []
-
-
-def _emit_set_not_null(change: SetNotNull, schema: str, lock_timeout: str,
-                        st: TableStats | None) -> tuple[list[_S], list[str]]:
-    table = change.table
-    qualified = _qualified(schema, table)
-    col = _ident(change.column)
-    scaffold = _ident(f"{change.column}_trib_notnull")
-    est_rows = st.rows if st else None
-    est_bytes = st.bytes if st else None
-
-    probe = preflight_sql(change, schema)
-    steps = [
-        _S(probe, "preflight", Safety.LOCK_HEAVY, True,
-           "cheap probe for existing NULLs before touching any lock; a nonzero count here "
-           "means SET NOT NULL would fail outright and the migration should abort here",
-           table, est_rows, est_bytes),
-        _S(f"{_lt(lock_timeout)};\nALTER TABLE {qualified} ADD CONSTRAINT {scaffold} "
-           f"CHECK ({col} IS NOT NULL) NOT VALID", "ddl", Safety.LOCK_HEAVY, True,
-           "scaffolding CHECK, added NOT VALID so no scan happens yet",
-           table, est_rows, est_bytes),
-        _S(f"ALTER TABLE {qualified} VALIDATE CONSTRAINT {scaffold}", "validate",
-           Safety.LOCK_HEAVY, True,
-           "validates the scaffolding CHECK under SHARE UPDATE EXCLUSIVE, not ACCESS EXCLUSIVE",
-           table, est_rows, est_bytes),
-        _S(f"{_lt(lock_timeout)};\nALTER TABLE {qualified} ALTER COLUMN {col} SET NOT NULL",
-           "ddl", Safety.LOCK_HEAVY, True,
-           "PG12+ uses the already-validated CHECK to skip its own full-table scan",
-           table, est_rows, est_bytes),
-        _S(f"{_lt(lock_timeout)};\nALTER TABLE {qualified} DROP CONSTRAINT {scaffold}",
-           "ddl", Safety.LOCK_HEAVY, True,
-           "scaffolding CHECK is now redundant with the real NOT NULL and is removed",
-           table, est_rows, est_bytes),
-    ]
-    return steps, []
 
 
 _CIC_RE = re.compile(r"(?i)^(CREATE\s+(?:UNIQUE\s+)?INDEX\s+)")
@@ -458,14 +569,9 @@ def _emit_create_index(change: CreateIndex, schema: str, lock_timeout: str,
     est_bytes = st.bytes if st else None
 
     return [
-        # SET lock_timeout is its own step, never combined with the CIC
-        # statement below into one query string: Postgres wraps a
-        # multi-statement simple query in an implicit transaction block, and
-        # CREATE INDEX CONCURRENTLY fails outright inside any transaction.
-        _S(_lt(lock_timeout), "ddl", Safety.LOCK_HEAVY, False,
-           "set standalone -- combining this with CREATE INDEX CONCURRENTLY in one query "
-           "string would implicitly wrap both in a transaction, and CIC cannot run in one",
-           table, est_rows, est_bytes),
+        _lock_timeout_step(lock_timeout, table, est_rows, est_bytes,
+            "set standalone -- combining this with CREATE INDEX CONCURRENTLY in one query "
+            "string would implicitly wrap both in a transaction, and CIC cannot run in one"),
         _S(concurrent, "index_concurrent", Safety.LOCK_HEAVY, False,
            "CONCURRENTLY builds the index without blocking writes for the whole build; must "
            "run outside any transaction. A cancelled run leaves an INVALID index behind -- "
@@ -474,8 +580,36 @@ def _emit_create_index(change: CreateIndex, schema: str, lock_timeout: str,
     ], []
 
 
+def _emit_retype_no_pk_fallback(change: AlterColumnType, schema: str, lock_timeout: str,
+                                 st: TableStats | None) -> tuple[list[_S], list[str]]:
+    """R19: a large table with no known primary key cannot be safely
+    batch-backfilled by PK range -- that is a real limitation, not something
+    to paper over with a placeholder. Falls back to the same single plain
+    ALTER the small-table path uses, with a warning explaining why the safe
+    path was unavailable so a human sees the tradeoff up front.
+    """
+    table = change.table
+    est_rows = st.rows if st else None
+    est_bytes = st.bytes if st else None
+    steps: list[_S] = []
+
+    probe = preflight_sql(change, schema)
+    if probe:
+        steps.append(_S(probe, "preflight", Safety.REWRITE, True,
+            "cheap probe for values that would fail the cast, before taking any lock",
+            table, est_rows, est_bytes))
+
+    stmt = render(change, schema)
+    steps.append(_S(f"{_lt(lock_timeout)};\n{stmt}", "ddl", Safety.REWRITE, True,
+        "no primary key available for a safe batched backfill on this large table -- "
+        "falls back to a single ALTER under ACCESS EXCLUSIVE; see the plan's warnings",
+        table, est_rows, est_bytes))
+
+    return steps, [_warn_no_pk_fallback(table, st)]
+
+
 def _shadow_dance(change: AlterColumnType, schema: str, lock_timeout: str,
-                   batch_size: int, st: TableStats | None) -> tuple[list[_S], list[str]]:
+                   batch_size: int, st: TableStats | None, pk_col: str) -> tuple[list[_S], list[str]]:
     table = change.table
     column = change.column
     new_type = change.new_type
@@ -485,6 +619,7 @@ def _shadow_dance(change: AlterColumnType, schema: str, lock_timeout: str,
     shadow_col = _ident(shadow_name)
     func_ident = _qualified(schema, f"{table}_{column}_trib_sync")
     trig_ident = _ident(f"{table}_{column}_trib_sync_trg")
+    pk_ident = _ident(pk_col)
     est_rows = st.rows if st else None
     est_bytes = st.bytes if st else None
 
@@ -518,21 +653,21 @@ def _shadow_dance(change: AlterColumnType, schema: str, lock_timeout: str,
         "never races a concurrent writer",
         table, est_rows, est_bytes))
 
-    # PLACEHOLDER CONTRACT (see module docstring): {pk} stands for this
-    # table's real primary-key column identifier, which this module cannot
-    # resolve -- it has no database connection. The executor must substitute
-    # it (quoted) before running each batch. %(cursor)s / %(batch_size)s are
-    # genuine psycopg bind parameters, re-supplied every iteration from the
-    # last committed cursor_val and the configured batch_size.
+    # R19: fully resolved -- pk_ident is this table's real (quoted)
+    # primary-key column, supplied by the caller via pk_columns. No
+    # placeholder text appears anywhere in this statement. %(cursor)s and
+    # %(batch_size)s are genuine psycopg bind parameters (not template
+    # text), meant to be re-supplied every iteration by the executor from
+    # the last committed cursor_val and the configured batch_size.
     backfill_stmt = (
         f"{_lt(lock_timeout)};\n"
         f"WITH batch AS (\n"
-        f"    SELECT {{pk}} AS pk_val FROM {qualified}\n"
-        f"    WHERE {{pk}} > %(cursor)s\n"
-        f"    ORDER BY {{pk}} LIMIT %(batch_size)s\n"
+        f"    SELECT {pk_ident} AS pk_val FROM {qualified}\n"
+        f"    WHERE {pk_ident} > %(cursor)s\n"
+        f"    ORDER BY {pk_ident} LIMIT %(batch_size)s\n"
         f")\n"
         f"UPDATE {qualified} AS t SET {shadow_col} = t.{col}::{new_type}\n"
-        f"FROM batch WHERE t.{{pk}} = batch.pk_val\n"
+        f"FROM batch WHERE t.{pk_ident} = batch.pk_val\n"
         f"RETURNING batch.pk_val"
     )
     steps.append(_S(backfill_stmt, "backfill", Safety.REWRITE, False,
@@ -546,26 +681,56 @@ def _shadow_dance(change: AlterColumnType, schema: str, lock_timeout: str,
         "not yet covered every row",
         table, est_rows, est_bytes))
 
-    swap_stmt = (
-        f"{_lt(lock_timeout)};\n"
-        f"DROP TRIGGER IF EXISTS {trig_ident} ON {qualified};\n"
-        f"DROP FUNCTION IF EXISTS {func_ident}();\n"
-        f"ALTER TABLE {qualified} DROP COLUMN {col};\n"
-        f"ALTER TABLE {qualified} RENAME COLUMN {shadow_col} TO {col}"
-    )
+    # R20: restore NOT NULL/DEFAULT that the shadow column never had. NOT
+    # NULL is validated on the shadow column *before* the swap (same
+    # NOT VALID CHECK / VALIDATE trick as SetNotNull) so the swap's own
+    # SET NOT NULL only pays for a catalog update, not a fresh scan under
+    # the swap transaction's ACCESS EXCLUSIVE lock.
+    notnull_scaffold = None
+    if change.nullable is False:
+        notnull_scaffold = _ident(f"{column}_trib_shadow_notnull")
+        steps.append(_S(
+            f"{_lt(lock_timeout)};\nALTER TABLE {qualified} ADD CONSTRAINT {notnull_scaffold} "
+            f"CHECK ({shadow_col} IS NOT NULL) NOT VALID", "ddl", Safety.REWRITE, True,
+            "restores NOT NULL on the shadow column ahead of the swap, validated here so the "
+            "swap's own SET NOT NULL is metadata-only instead of rescanning under its lock",
+            table, est_rows, est_bytes))
+        steps.append(_S(f"ALTER TABLE {qualified} VALIDATE CONSTRAINT {notnull_scaffold}",
+            "validate", Safety.REWRITE, True,
+            "validates the shadow column's NOT NULL scaffold under SHARE UPDATE EXCLUSIVE",
+            table, est_rows, est_bytes))
+
+    swap_lines = [
+        _lt(lock_timeout),
+        f"DROP TRIGGER IF EXISTS {trig_ident} ON {qualified}",
+        f"DROP FUNCTION IF EXISTS {func_ident}()",
+    ]
+    if change.nullable is False:
+        swap_lines.append(f"ALTER TABLE {qualified} ALTER COLUMN {shadow_col} SET NOT NULL")
+    if change.default is not None:
+        swap_lines.append(
+            f"ALTER TABLE {qualified} ALTER COLUMN {shadow_col} SET DEFAULT {change.default}")
+    swap_lines.append(f"ALTER TABLE {qualified} DROP COLUMN {col}")
+    swap_lines.append(f"ALTER TABLE {qualified} RENAME COLUMN {shadow_col} TO {col}")
+    if notnull_scaffold is not None:
+        # Constraints reference columns by attnum, not name, so this scaffold
+        # -- created against the shadow column before it was renamed -- is
+        # still reachable by its own stable name after the rename above.
+        swap_lines.append(f"ALTER TABLE {qualified} DROP CONSTRAINT {notnull_scaffold}")
+    swap_stmt = ";\n".join(swap_lines)
     steps.append(_S(swap_stmt, "swap", Safety.REWRITE, True,
         "one short transaction: drop the sync trigger/function, drop the old column, rename "
-        "the shadow column into place. NOT NULL/DEFAULT on the original column are not "
-        "restored here -- AlterColumnType does not carry that information; a caller that "
-        "needs either preserved must add SetNotNull/SetDefault as changes in the same commit",
+        "the shadow column into place, restoring NOT NULL/DEFAULT when the target column "
+        "needs them (R20) -- both were populated by diff.py from the target column, since a "
+        "plain ALTER never loses either but this shadow-column swap otherwise would",
         table, est_rows, est_bytes))
 
     return steps, [_warn_rewrite(table, st)]
 
 
 def _emit_alter_column_type(change: AlterColumnType, schema: str, lock_timeout: str,
-                             batch_size: int, safety: Safety,
-                             st: TableStats | None) -> tuple[list[_S], list[str]]:
+                             batch_size: int, safety: Safety, st: TableStats | None,
+                             pk_col: str | None) -> tuple[list[_S], list[str]]:
     table = change.table
     est_rows = st.rows if st else None
     est_bytes = st.bytes if st else None
@@ -587,11 +752,14 @@ def _emit_alter_column_type(change: AlterColumnType, schema: str, lock_timeout: 
                          table, est_rows, est_bytes))
         return steps, []
 
-    return _shadow_dance(change, schema, lock_timeout, batch_size, st)
+    if pk_col is None:
+        return _emit_retype_no_pk_fallback(change, schema, lock_timeout, st)
+
+    return _shadow_dance(change, schema, lock_timeout, batch_size, st, pk_col)
 
 
 def _emit(change: Change, schema: str, lock_timeout: str, batch_size: int,
-          safety: Safety, st: TableStats | None) -> tuple[list[_S], list[str]]:
+          safety: Safety, st: TableStats | None, pk_col: str | None) -> tuple[list[_S], list[str]]:
     table = _table_name(change)
     est_rows = st.rows if st else None
     est_bytes = st.bytes if st else None
@@ -615,7 +783,8 @@ def _emit(change: Change, schema: str, lock_timeout: str, batch_size: int,
                                 est_rows, est_bytes, "metadata-only catalog change"), []
 
         case AlterColumnType():
-            return _emit_alter_column_type(change, schema, lock_timeout, batch_size, safety, st)
+            return _emit_alter_column_type(change, schema, lock_timeout, batch_size, safety,
+                                            st, pk_col)
 
         case SetNotNull():
             return _emit_set_not_null(change, schema, lock_timeout, st)
@@ -633,13 +802,20 @@ def _emit(change: Change, schema: str, lock_timeout: str, batch_size: int,
 # --- public entry point --------------------------------------------------------
 
 def plan(changes: list[Change], stats: dict[str, TableStats], schema: str, *,
-         lock_timeout: str = "3s", batch_size: int = 10_000) -> Plan:
+         lock_timeout: str = "3s", batch_size: int = 10_000,
+         pk_columns: dict[str, str] | None = None) -> Plan:
     """Turn `changes` into an ordered, safety-classified, safety-rewritten `Plan`.
 
     `stats` is measured size (`introspect.table_stats`'s output), keyed by
     table name -- a table absent from it (not yet created, or simply not
     measured) is treated as unknown and, per R12, handled as if it were
     large rather than assumed small.
+
+    `pk_columns` (R19) maps table name to its single-column primary key, for
+    callers that hold a `Snapshot` and can derive it. A table missing from
+    this map (or `pk_columns` not supplied at all) that needs a rewriting
+    retype on a large table cannot be safely batch-backfilled by PK range --
+    see `_emit_retype_no_pk_fallback` and the module docstring.
     """
     ordered = _order(changes)
     intermediate: list[_S] = []
@@ -649,7 +825,9 @@ def plan(changes: list[Change], stats: dict[str, TableStats], schema: str, *,
         table = _table_name(change)
         st = stats.get(table) if table is not None else None
         safety = classify(change, st)
-        emitted_steps, emitted_warnings = _emit(change, schema, lock_timeout, batch_size, safety, st)
+        pk_col = pk_columns.get(table) if (pk_columns and table is not None) else None
+        emitted_steps, emitted_warnings = _emit(change, schema, lock_timeout, batch_size,
+                                                 safety, st, pk_col)
         intermediate.extend(emitted_steps)
         warnings.extend(w for w in emitted_warnings if w)
 
