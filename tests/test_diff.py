@@ -13,6 +13,7 @@ from tributary.model import (
     DropTable,
     Index,
     RenameColumn,
+    RenameTable,
     SetNotNull,
     Snapshot,
     Table,
@@ -152,6 +153,52 @@ def test_detect_renames_refuses_ambiguous_same_type_candidates():
     a = Snapshot({"users": tbl("users", first_name="text", last_name="text")})
     b = Snapshot({"users": tbl("users", given_name="text", family_name="text")})
     assert detect_renames(a, b) == []
+
+
+# --- R16: table renames are the same failure one level up ------------------
+#
+# A renamed table read as DropTable + CreateTable does not rename anything
+# executed against a real, populated table -- it drops the table and every
+# row in it, then creates an empty one under the new name. Same argument as
+# the column case, applied to tables; RenameTable must be preferred whenever
+# the op log declares the intent.
+
+def test_op_log_turns_table_drop_plus_create_into_a_rename_table():
+    a = Snapshot({"users": tbl("users", id="int8")})
+    b = Snapshot({"accounts": tbl("accounts", id="int8")})
+    ops = [{"op": "rename_table", "old": "users", "new": "accounts"}]
+    changes = diff(a, b, ops)
+    assert changes == [RenameTable("users", "accounts")]
+    assert not any(isinstance(c, DropTable) for c in changes)
+    assert not any(isinstance(c, CreateTable) for c in changes)
+
+
+def test_table_rename_and_column_addition_in_the_same_commit_is_rename_plus_add_column():
+    a = Snapshot({"users": tbl("users", id="int8")})
+    b = Snapshot({"accounts": tbl("accounts", id="int8", email="text")})
+    ops = [{"op": "rename_table", "old": "users", "new": "accounts"}]
+    changes = diff(a, b, ops)
+    assert changes == [
+        RenameTable("users", "accounts"),
+        AddColumn("accounts", b.tables["accounts"].columns["email"]),
+    ]
+
+
+def test_structurally_identical_table_drop_and_create_without_op_log_is_never_guessed_as_a_rename():
+    """Pins the deliberate refusal to infer table renames heuristically
+    (R16): even though `accounts` is byte-for-byte the same shape as the
+    dropped `users`, with no op log declaring intent, diff must report an
+    honest DropTable + CreateTable and never invent a RenameTable -- unlike
+    a single column, there is no cheap way to be confident two tables with
+    an identical column set are "the same table" rather than an unrelated
+    coincidence.
+    """
+    a = Snapshot({"users": tbl("users", id="int8")})
+    b = Snapshot({"accounts": tbl("accounts", id="int8")})
+    changes = diff(a, b)
+    assert DropTable("users") in changes
+    assert any(isinstance(c, CreateTable) and c.table.name == "accounts" for c in changes)
+    assert not any(isinstance(c, RenameTable) for c in changes)
 
 
 # --- ordering: drops before table work before column work before creates ---
