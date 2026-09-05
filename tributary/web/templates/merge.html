@@ -21,12 +21,19 @@
     <fieldset class="rounded border border-slate-300 p-3 mb-3">
       <legend class="text-sm font-mono px-1">{{ c.kind }} at {{ c.path }}</legend>
       <input type="hidden" name="path" value="{{ c.path }}">
+      {# Each conflict gets its own radio-group name (`side_<index>`) --
+         HTML scopes "exactly one selected" by `name` across the whole
+         <form>, not by the enclosing <fieldset>, so a shared name="side"
+         here would collapse every conflict's ours/theirs pair into one
+         mutually-exclusive group site-wide the moment a merge has more
+         than one conflict. See resolve_merge in app.py for the matching
+         server-side read. #}
       <label class="block text-sm py-0.5">
-        <input type="radio" name="side" value="ours" required>
+        <input type="radio" name="side_{{ loop.index0 }}" value="ours" required>
         keep {{ merge.target }}: <span class="font-mono">{{ c.ours }}</span>
       </label>
       <label class="block text-sm py-0.5">
-        <input type="radio" name="side" value="theirs">
+        <input type="radio" name="side_{{ loop.index0 }}" value="theirs">
         take {{ merge.source }}: <span class="font-mono">{{ c.theirs }}</span>
       </label>
     </fieldset>

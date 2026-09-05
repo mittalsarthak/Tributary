@@ -40,20 +40,18 @@ The startup handler below deliberately clears both dicts on every boot for
 exactly this reason -- see its docstring.
 
 **Merges never block the request thread.** `POST /merges/{id}/run` starts
-`_execute_merge` in a background `threading.Thread` and returns
-`progress.html`, which opens an `EventSource` against
+`_execute_merge` in a background `threading.Thread`, never joins it, and
+returns `progress.html` immediately, which opens an `EventSource` against
 `GET /merges/{id}/events` (Server-Sent Events, plain `text/event-stream` --
-no extra dependency). The one nuance: the route *does* join that thread with
-a bounded timeout (`_JOIN_TIMEOUT`) before responding, so a demo-scale
-migration (the only kind these tests exercise) is reflected immediately in
-the very next request, while a genuinely long-running migration on a real,
-populated table still returns well before it finishes and lets the SSE
-stream carry the rest -- the thread keeps running either way. This is a
-deliberate middle ground, not an oversight: a pure fire-and-forget response
-would make `test_merge_with_a_conflict_reports_it_before_offering_to_run`
-(the very next `POST /merges` call, immediately after `/run`, needs the
-first merge to have already landed on `main`) racy against a background
-thread with no synchronisation at all.
+no extra dependency) to carry the rest. This is the same fire-and-forget
+pattern `_grow_events_bg` already uses below: a real migration can run for
+minutes, and tying up one of FastAPI's threadpool workers for any bounded
+wait on every `POST /run` is exactly the class of problem this constraint
+exists to prevent. A test that needs the merge to have actually landed
+before its next request (e.g. a second `POST /merges` that expects to see
+a conflict against what the first merge just committed to `main`) polls
+`_merges[mid].status` until it reaches a terminal state first -- the same
+way `_wait_for_grow_to_finish` polls `_grow_state` in `tests/test_web.py`.
 
 Sync `def` throughout, never `async def` -- FastAPI runs a sync endpoint in
 its threadpool, and `Form(...)`-declared parameters are how form data is
@@ -67,9 +65,11 @@ import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 
+import anyio.from_thread
 import psycopg
 from fastapi import Depends, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -135,9 +135,6 @@ _merges: dict[str, MergeState] = {}
 
 _grow_lock = threading.Lock()
 _grow_state = {"running": False, "done": 0, "target": 0}
-
-# Bounded wait before `/merges/{id}/run` responds -- see module docstring.
-_JOIN_TIMEOUT = 10.0
 
 
 @app.on_event("startup")
@@ -488,11 +485,18 @@ def show_diff(branch: str, request: Request, target: str = "main", conn=Depends(
     theirs_snap = snapshot(conn, b.schema_name)
     with _LOCK:
         ops = list(_pending_ops.get(branch, []))
-    changes = diff_mod.diff(ours_snap, theirs_snap, ops=ops)
-    described = [(type(c).__name__, _describe_change(c)) for c in changes]
+    try:
+        changes = diff_mod.diff(ours_snap, theirs_snap, ops=ops)
+        described = [(type(c).__name__, _describe_change(c)) for c in changes]
 
-    stats = table_stats(conn, t.schema_name)
-    plan_result = planner.plan(changes, stats, t.schema_name, pk_columns=_pk_columns(ours_snap))
+        stats = table_stats(conn, t.schema_name)
+        plan_result = planner.plan(changes, stats, t.schema_name, pk_columns=_pk_columns(ours_snap))
+    except ValueError as e:
+        # Every other plan-building path (`_build_plan`, used by both
+        # `create_merge` and `resolve_merge`) wraps `diff`/`planner.plan`
+        # like this; this route did not, which meant it alone could turn a
+        # domain `ValueError` into a bare 500 instead of a sentence.
+        return _error_page(request, _status_for_value_error(str(e)), str(e))
 
     return templates.TemplateResponse(request, "diff.html", {
         "branch": b, "target": t, "changes": described, "plan": plan_result,
@@ -562,11 +566,26 @@ def _build_plan(conn, state: MergeState) -> None:
 
 
 def _merge_context(state: MergeState, *, error: str | None = None) -> dict:
+    """Build `merge.html`'s template context.
+
+    `state.result` is the merge session's *original*, frozen three-way
+    result -- `state.result.conflicts` never changes, even after
+    `resolve_merge` successfully resolves every one of them. Whether
+    conflicts are still outstanding is tracked separately, by
+    `state.status` (set back to "ready" on a successful resolve): gating on
+    `state.status == "conflicts"` here, not on `state.result.conflicts`
+    directly, is what lets the template (and `can_run`) ever show the
+    safety report/run button for a merge that *had* conflicts once they are
+    actually resolved -- discovered because no test before this fix round
+    ever called `POST /merges/{id}/resolve` and then tried to run the
+    result.
+    """
+    unresolved = state.status == "conflicts"
     return {
         "merge": state,
-        "conflicts": _describe_conflicts(state.result.conflicts),
+        "conflicts": _describe_conflicts(state.result.conflicts) if unresolved else [],
         "plan": state.plan,
-        "can_run": state.status == "ready" and not state.result.conflicts,
+        "can_run": state.status == "ready",
         "error": error,
     }
 
@@ -599,6 +618,11 @@ def create_merge(request: Request, source: str = Form(...), target: str = Form("
         try:
             _build_plan(conn, state)
         except ValueError as e:
+            # The row above was already inserted with status "ready" (the
+            # `status` var, chosen before plan-building could fail) -- leave
+            # it claiming success and this is a ghost audit row nobody ever
+            # sees fail. Mark it plainly instead.
+            _update_merge_row(conn, mid, status="failed", error=str(e))
             return _error_page(request, 404, str(e))
         state.status = "ready"
         _update_merge_row(conn, mid, conflicts=Jsonb([]), plan=_plan_json(state.plan))
@@ -616,7 +640,6 @@ def resolve_merge(
     merge_id: str,
     request: Request,
     path: list[str] = Form(default=[]),
-    side: list[str] = Form(default=[]),
     conn=Depends(get_conn),
 ):
     with _LOCK:
@@ -624,7 +647,34 @@ def resolve_merge(
     if state is None:
         return _error_page(request, 404, f"no such merge {merge_id!r}")
 
-    choices = dict(zip(path, side))
+    # merge.html gives each conflict's ours/theirs pair its own radio-group
+    # name (`side_<index>`, matching `loop.index0`) so the browser scopes
+    # "exactly one selected" to that one conflict, rather than every
+    # conflict on the page collapsing into a single group under a shared
+    # name="side". A per-index field name can't be declared as a typed
+    # `Form(...)` parameter -- the count varies per merge -- so the full
+    # form is read once here via anyio's from-thread bridge: a synchronous
+    # call made from the worker thread FastAPI already runs this `def`
+    # endpoint on (see `run_in_threadpool` -> `anyio.to_thread.run_sync` in
+    # starlette/fastapi's own routing), no `async`/`await` written in this
+    # module. Each `side_<i>` is then looked up by the same index that
+    # named it -- paired explicitly by position, never by a bare `zip`
+    # that would silently truncate to the shorter list.
+    form = anyio.from_thread.run(request.form)
+    sides = [form.get(f"side_{i}") for i in range(len(path))]
+
+    # A length mismatch or a missing selection must never resolve quietly:
+    # this is exactly the class of bug (`dict(zip(path, side))` silently
+    # truncating to the shorter list) that let one conflict's choice get
+    # applied to a different, unlooked-at conflict.
+    if len(path) != len(state.result.conflicts) or any(s is None for s in sides):
+        n = len(state.result.conflicts)
+        msg = (f"a choice is missing for one or more of the {n} conflict"
+               f"{'s' if n != 1 else ''} -- every conflict must be resolved before continuing")
+        return templates.TemplateResponse(request, "merge.html",
+                                           _merge_context(state, error=msg), status_code=400)
+
+    choices = dict(zip(path, sides, strict=True))
     try:
         merged = merge_mod.resolve(state.result, choices)
     except ValueError as e:
@@ -676,28 +726,21 @@ def _execute_merge(merge_id: str) -> None:
                      [{"op": "merge", "source": state.source, "base_commit": state.base_commit}])
         with _LOCK:
             state.status = "done"
-        conn.execute(
-            "UPDATE _tributary.merges SET status = %s, finished_at = now() WHERE id = %s",
-            ("done", merge_id),
-        )
+        _update_merge_row(conn, merge_id, status="done", finished_at=datetime.now(timezone.utc))
     except executor.StepFailed as e:
         table = getattr(e.step, "table", None)
         msg = f"merge failed at step {e.step.seq}{f' on {table}' if table else ''}: {e.cause}"
         with _LOCK:
             state.status = "failed"
             state.error = msg
-        conn.execute(
-            "UPDATE _tributary.merges SET status = %s, error = %s, finished_at = now() WHERE id = %s",
-            ("failed", msg, merge_id),
-        )
+        _update_merge_row(conn, merge_id, status="failed", error=msg,
+                           finished_at=datetime.now(timezone.utc))
     except Exception as e:  # pragma: no cover - last-resort safety net for the background thread
         with _LOCK:
             state.status = "failed"
             state.error = str(e)
-        conn.execute(
-            "UPDATE _tributary.merges SET status = %s, error = %s, finished_at = now() WHERE id = %s",
-            ("failed", str(e), merge_id),
-        )
+        _update_merge_row(conn, merge_id, status="failed", error=str(e),
+                           finished_at=datetime.now(timezone.utc))
     finally:
         conn.close()
 
@@ -708,7 +751,14 @@ def run_merge(merge_id: str, request: Request, conn=Depends(get_conn)):
         state = _merges.get(merge_id)
     if state is None:
         return _error_page(request, 404, f"no such merge {merge_id!r}")
-    if state.result.conflicts:
+    # `state.result.conflicts` is the merge's *original*, frozen conflict
+    # list -- it never empties out, even once every conflict has been
+    # resolved (see `_merge_context`'s docstring). `state.status` is the
+    # field a successful `resolve_merge` actually updates, so it is the one
+    # to gate on here -- checking `state.result.conflicts` instead would
+    # permanently refuse to run any merge that ever had a conflict, resolved
+    # or not.
+    if state.status == "conflicts":
         return _error_page(request, 400, "cannot run a merge with unresolved conflicts")
     if state.plan is None:
         return _error_page(request, 400, "this merge has no plan yet")
@@ -721,9 +771,7 @@ def run_merge(merge_id: str, request: Request, conn=Depends(get_conn)):
 
     if start:
         conn.execute("UPDATE _tributary.merges SET status = %s WHERE id = %s", ("running", merge_id))
-        t = threading.Thread(target=_execute_merge, args=(merge_id,), daemon=True)
-        t.start()
-        t.join(_JOIN_TIMEOUT)  # bounded wait -- see module docstring
+        threading.Thread(target=_execute_merge, args=(merge_id,), daemon=True).start()
 
     return templates.TemplateResponse(request, "progress.html", {"merge": state})
 

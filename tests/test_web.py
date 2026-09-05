@@ -29,6 +29,20 @@ rulings call out specifically:
 `DATABASE_URL`/`TRIBUTARY_AUTOSEED=1` pointed at the test Postgres container,
 and cleans every Tributary-managed schema before and after each test so
 tests never see another test's branches.
+
+Fix round (post-review):
+- `test_resolve_with_two_conflicts_applies_each_choice_independently` --
+  every conflict test above adds a single column named `x` on both
+  branches, which is structurally incapable of catching the bug where
+  `merge.html` gave every conflict's radio pair the same `name="side"`
+  (collapsing all of them into one browser-side radio group) and
+  `resolve_merge` paired `path`/`side` via a truncating `zip`. Two
+  conflicting columns, resolved with different choices, through the real
+  `POST /merges/{id}/resolve` route.
+- `_wait_for_merge` replaces the bounded `t.join()` `run_merge` used to do
+  before responding (removed: it tied up a threadpool worker for up to 10s
+  on every run). Tests that need a merge to have actually landed before
+  their next request now poll `MergeState.status` instead.
 """
 
 import re
@@ -43,6 +57,27 @@ def _merge_id(html: str) -> str:
     m = re.search(r'data-merge-id="([^"]+)"', html)
     assert m, f"no data-merge-id found in response:\n{html}"
     return m.group(1)
+
+
+def _wait_for_merge(mid: str, timeout: float = 10.0) -> None:
+    """`POST /merges/{id}/run` starts `_execute_merge` in a background
+    thread and returns immediately -- no bounded `t.join()` any more (fix
+    round: that join tied up a FastAPI threadpool worker for up to
+    `_JOIN_TIMEOUT` seconds on every run, the exact thing "long-running
+    merges must not block the request thread" exists to prevent). A test
+    that needs the merge to have actually landed on its target branch
+    before issuing its next request polls the in-memory `MergeState.status`
+    until it reaches a terminal state, the same way `_wait_for_grow_to_finish`
+    below polls `_grow_state` for the fire-and-forget grow thread.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with web_app._LOCK:
+            state = web_app._merges.get(mid)
+            if state is not None and state.status in ("done", "failed"):
+                return
+        time.sleep(0.05)
+    pytest.fail(f"merge {mid!r} did not reach a terminal status in time")
 
 
 def _wait_for_grow_to_finish(timeout: float = 5.0) -> None:
@@ -101,6 +136,7 @@ def test_merge_with_a_conflict_reports_it_before_offering_to_run(client):
     r1 = client.post("/merges", data={"source": "a", "target": "main"})
     mid = _merge_id(r1.text)
     client.post(f"/merges/{mid}/run")
+    _wait_for_merge(mid)
 
     r = client.post("/merges", data={"source": "b", "target": "main"})
     assert "conflict" in r.text.lower()
@@ -125,6 +161,7 @@ def test_no_run_button_while_conflicts_are_unresolved(client):
     r1 = client.post("/merges", data={"source": "a", "target": "main"})
     mid = _merge_id(r1.text)
     client.post(f"/merges/{mid}/run")
+    _wait_for_merge(mid)
 
     r = client.post("/merges", data={"source": "b", "target": "main"})
     assert 'id="run-merge-btn"' not in r.text
@@ -143,6 +180,7 @@ def test_clean_merge_runs_and_updates_main(client):
 
     r2 = client.post(f"/merges/{mid}/run")
     assert r2.status_code == 200
+    _wait_for_merge(mid)
 
     diff_after = client.get("/branches/feature-x/diff?target=main")
     assert "nickname" not in diff_after.text  # main now has it too -- no more diff
@@ -164,12 +202,86 @@ def test_unresolved_conflicts_cannot_be_run(client):
     r1 = client.post("/merges", data={"source": "a", "target": "main"})
     mid_a = _merge_id(r1.text)
     client.post(f"/merges/{mid_a}/run")
+    _wait_for_merge(mid_a)
 
     r2 = client.post("/merges", data={"source": "b", "target": "main"})
     mid_b = _merge_id(r2.text)
     r3 = client.post(f"/merges/{mid_b}/run")
     assert r3.status_code < 500
     assert "conflict" in r3.text.lower()
+
+
+def test_resolve_with_two_conflicts_applies_each_choice_independently(client, conn):
+    """Fix round, R1: `merge.html` used to give every conflict's ours/theirs
+    radio pair the same `name="side"`. HTML scopes "exactly one selected" by
+    `name` across the whole <form>, not per <fieldset> -- so with two or
+    more conflicts, every radio on the page collapsed into one
+    mutually-exclusive group, and the browser could submit only a single
+    `side` value no matter how many `path` hidden fields were emitted.
+    Server-side, `dict(zip(path, side))` then silently truncated to
+    whichever list was shorter, applying the one submitted choice to only
+    the first conflict and dropping the rest.
+
+    Every existing conflict test (before this fix round) added a single
+    column named `x` on both branches -- structurally incapable of catching
+    this, since one conflict is exactly the case that still worked. This
+    test creates a branch with *two* conflicting columns and resolves them
+    with different choices (ours for one, theirs for the other), posting
+    the real field names the fixed template emits (`side_0`, `side_1`) to
+    the real `POST /merges/{id}/resolve` route -- never calling
+    `merge_mod.resolve` directly -- then runs the merge and checks the
+    actual column types in Postgres. A regression back to a shared
+    `name="side"` fails the markup assertions below outright; a regression
+    back to `zip(path, side)` pairing would resolve at most one of the two
+    conflicts and leave the other reported as still unresolved.
+    """
+    client.post("/branches", data={"name": "a"})
+    client.post("/branches", data={"name": "b"})
+    for br, x_type, y_type in (("a", "text", "text"), ("b", "int4", "int4")):
+        client.post(f"/branches/{br}/changes",
+                    data={"op": "add_column", "table": "users", "name": "x", "type": x_type})
+        client.post(f"/branches/{br}/changes",
+                    data={"op": "add_column", "table": "users", "name": "y", "type": y_type})
+        client.post(f"/branches/{br}/commit", data={"message": "add x and y"})
+
+    # Land "a" on main first (no conflict: main had neither column), so "b"
+    # against main now conflicts on both x and y (main/ours: text; b/theirs:
+    # int4, for both columns).
+    r_a = client.post("/merges", data={"source": "a", "target": "main"})
+    mid_a = _merge_id(r_a.text)
+    client.post(f"/merges/{mid_a}/run")
+    _wait_for_merge(mid_a)
+
+    r1 = client.post("/merges", data={"source": "b", "target": "main"})
+    mid = _merge_id(r1.text)
+    assert "2 conflicts" in r1.text
+    # The template-level fix: each fieldset's radios must carry a distinct
+    # `name`, not a shared "side" -- this is what a browser needs to treat
+    # them as independent radio groups at all.
+    assert 'name="side_0"' in r1.text
+    assert 'name="side_1"' in r1.text
+    assert 'name="side"' not in r1.text
+
+    r2 = client.post(f"/merges/{mid}/resolve", data={
+        "path": ["users/col/x", "users/col/y"],
+        "side_0": "theirs",  # x: take b's int4
+        "side_1": "ours",    # y: keep main's text
+    })
+    assert r2.status_code == 200
+    assert "conflict" not in r2.text.lower()
+    assert 'id="run-merge-btn"' in r2.text
+
+    client.post(f"/merges/{mid}/run")
+    _wait_for_merge(mid)
+
+    row = conn.execute(
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_schema = 'main' AND table_name = 'users' "
+        "AND column_name IN ('x', 'y')"
+    ).fetchall()
+    types = dict(row)
+    assert types["x"] == "integer"  # theirs
+    assert types["y"] == "text"     # ours
 
 
 def test_cannot_delete_main(client):
@@ -201,10 +313,15 @@ def test_grow_events_control_shows_current_size(client):
     assert "GB" in r.text or "gb" in r.text.lower()
 
 
-def test_seed_grow_endpoint_grows_the_table(client):
+def test_seed_grow_endpoint_grows_the_table(client, conn):
+    before = conn.execute("SELECT count(*) FROM main.events").fetchone()[0]
     r = client.post("/seed/grow", data={"target_rows": 8000})
     assert r.status_code < 500
     _wait_for_grow_to_finish()
+
+    after = conn.execute("SELECT count(*) FROM main.events").fetchone()[0]
+    assert after >= 8000
+    assert after > before
 
 
 def test_unknown_merge_id_is_a_readable_error(client):
