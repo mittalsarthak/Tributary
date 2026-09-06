@@ -170,20 +170,29 @@ local default) everything else depends on. `tributary/sql/schema.sql` defines `_
 
 ## Deployment
 
-Deploys to [Railway](https://railway.app) from the local directory — **not** from a GitHub
-repository. Nothing in this repository has been pushed to GitHub; that was a deliberate, binding
-instruction given mid-build (see `decisions.md`, "Not pushed to GitHub"), so Railway's normal
-GitHub-source deploy flow is unavailable here on purpose.
+Deployed on [Render](https://render.com) via the `render.yaml` blueprint in this repo: one web
+service plus one Postgres, both on the free plan.
 
-```
-railway login          # opens a browser to authenticate
-railway init            # creates a Railway project for this directory
-railway add             # add a Postgres plugin/addon
-railway up              # uploads this working directory directly and deploys it
-```
+**Dashboard → New → Blueprint → select this repository.** Render reads `render.yaml`, provisions
+both services, and wires `DATABASE_URL` between them. No other configuration is needed.
 
-Set `TRIBUTARY_AUTOSEED=1` on the Railway service (so the deployed URL is never an empty screen —
-the app seeds the demo workspace on startup when this is set). Railway injects `DATABASE_URL`
-automatically once the Postgres addon is attached; nothing else needs configuring. After deploying,
-confirm the public URL loads and that a full branch → diff → merge round-trip actually completes on
-the deployed instance, not only locally.
+Two things a visitor should know, because neither is a bug:
+
+- **The first visit after a quiet period takes ~30-60 seconds.** Render's free web services sleep
+  after about 15 minutes idle. It is waking up, not broken.
+- **The free Postgres expires 90 days after creation.** This deployment exists for a review window,
+  not permanently.
+
+The blueprint sets `TRIBUTARY_MAX_GROW_ROWS=1000000`, so the deployed demo offers only the 1M-row
+growth target — that lands the `events` table at ~125MB, inside the free plan's 1GB. The 10M and
+50M buttons are hidden *and* refused server-side there. That is a limit of the free database, not
+of the tool: the 5GB evidence is in [`bench/RESULTS.md`](bench/RESULTS.md), measured on a real
+5.016 GiB table.
+
+Earlier in the build nothing was pushed to GitHub (a binding instruction — see `decisions.md`), which
+ruled out repo-based deploys and pointed at Railway's local-directory flow. The repository has since
+been published, and Railway has no free tier, so Render is the host that actually fits the
+constraints.
+
+Running elsewhere: the app needs only a `DATABASE_URL` and a Postgres it can reach. Set
+`TRIBUTARY_AUTOSEED=1` so the URL is never an empty screen, and `PORT` is honoured automatically.

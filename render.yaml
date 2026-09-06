@@ -1,0 +1,43 @@
+# Render blueprint: one web service + one Postgres, both on the free plan.
+#
+# Deploy: render.com/dashboard -> New -> Blueprint -> pick this repo. Render reads
+# this file, provisions both services, and wires DATABASE_URL between them.
+#
+# Free-plan facts worth knowing before you rely on this:
+#   - the web service sleeps after ~15 minutes idle; the next visit takes ~30-60s
+#     to wake. Not broken, just cold.
+#   - the free Postgres expires 90 days after creation and is then deleted. Fine
+#     for a few weeks of review; do not leave anything you care about on it.
+#   - free Postgres allows 1GB of storage. TRIBUTARY_MAX_GROW_ROWS is set to 1M
+#     below, which lands the demo `events` table at ~125MB (measured). The 10M and
+#     50M buttons would blow past 1GB, so the cap hides and refuses them -- the
+#     5GB evidence lives in bench/RESULTS.md and does not need this control.
+
+services:
+  - type: web
+    name: tributary
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    # Render injects PORT; the Dockerfile's CMD already honours it. A hardcoded
+    # port is the classic silent failure here -- the service builds, starts, and
+    # then fails its health check for reasons the logs do not make obvious.
+    healthCheckPath: /
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tributary-db
+          property: connectionString
+      # Seeds the demo workspace on first boot so the URL is never an empty screen.
+      # Both store.init and seed.ensure_demo are idempotent, so this is safe on
+      # every restart -- and on a free plan there are many restarts.
+      - key: TRIBUTARY_AUTOSEED
+        value: "1"
+      - key: TRIBUTARY_MAX_GROW_ROWS
+        value: "1000000"
+
+databases:
+  - name: tributary-db
+    plan: free
+    databaseName: tributary
+    user: tributary
