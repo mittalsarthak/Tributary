@@ -826,3 +826,36 @@ def test_a_merged_branch_can_still_be_deleted(client):
     r = client.delete("/branches/spent")
     assert r.status_code < 500, f"deleting a merged branch returned {r.status_code}"
     assert "spent" not in client.get("/").text.replace("spent_col", "")
+
+
+# --- the grow control on a hosted database ------------------------------------
+#
+# "Grow to 50M rows" is a great demo locally and a liability on someone else's
+# hosted Postgres: an evaluator's click could blow past the plan's disk allowance,
+# cost the owner money, or fail halfway -- a bad first impression of the exact
+# feature meant to impress. TRIBUTARY_MAX_GROW_ROWS caps it where that matters.
+
+
+def test_grow_options_are_capped_when_the_env_var_is_set(client, monkeypatch):
+    monkeypatch.setattr(web_app, "MAX_GROW_ROWS", 1_000_000)
+    html = client.get("/").text
+    assert 'value="1000000"' in html, "the smallest option should survive the cap"
+    assert 'value="10000000"' not in html
+    assert 'value="50000000"' not in html
+
+
+def test_all_grow_options_are_offered_when_uncapped(client, monkeypatch):
+    monkeypatch.setattr(web_app, "MAX_GROW_ROWS", None)
+    html = client.get("/").text
+    for v in ("1000000", "10000000", "50000000"):
+        assert f'value="{v}"' in html
+
+
+def test_the_cap_is_enforced_server_side_not_just_in_the_markup(client, monkeypatch):
+    """Hiding a button is not enforcement -- anyone can POST the value directly."""
+    monkeypatch.setattr(web_app, "MAX_GROW_ROWS", 1_000_000)
+    r = client.post("/seed/grow", data={"target_rows": 50_000_000})
+    assert r.status_code == 400, "a request above the cap must be refused, not just un-rendered"
+    assert "50,000,000" in r.text or "cap" in r.text.lower()
+    with web_app._grow_lock:
+        assert not web_app._grow_state["running"], "the refused request must not start a growth"

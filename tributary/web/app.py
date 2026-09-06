@@ -137,6 +137,23 @@ class MergeState:
 
 _merges: dict[str, MergeState] = {}
 
+# Growing the demo table is a great local demonstration and a liability on a
+# hosted database: an evaluator clicking "50M rows" can blow past the plan's disk
+# allowance, cost the owner money, or fail halfway -- a poor first impression of
+# the exact feature meant to impress. Set TRIBUTARY_MAX_GROW_ROWS in production.
+# The 5GB evidence lives in bench/RESULTS.md and does not depend on this button.
+GROW_OPTIONS = (1_000_000, 10_000_000, 50_000_000)
+_max_grow = os.environ.get("TRIBUTARY_MAX_GROW_ROWS")
+MAX_GROW_ROWS: int | None = int(_max_grow) if _max_grow else None
+
+
+def grow_options() -> list[int]:
+    """Offered growth targets, honouring the production cap."""
+    if MAX_GROW_ROWS is None:
+        return list(GROW_OPTIONS)
+    return [n for n in GROW_OPTIONS if n <= MAX_GROW_ROWS]
+
+
 _grow_lock = threading.Lock()
 _grow_state = {"running": False, "done": 0, "target": 0}
 
@@ -331,6 +348,7 @@ def _home_response(request: Request, conn, *, status_code: int = 200, error: str
         "error": error,
         "has_feature_branches": has_feature_branches,
         "events": events,
+        "grow_options": grow_options(),
         "grow_running": grow_running,
         "grow_done": grow_done,
         "grow_target": grow_target,
@@ -1065,6 +1083,14 @@ def _grow_events_bg(target_rows: int) -> None:
 
 @app.post("/seed/grow")
 def grow(request: Request, target_rows: int = Form(...), conn=Depends(get_conn)):
+    # Enforced here, not only by which buttons render: hiding a control is not a
+    # limit, since the value can be posted directly.
+    if MAX_GROW_ROWS is not None and target_rows > MAX_GROW_ROWS:
+        return _home_response(
+            request, conn, status_code=400,
+            error=(f"growing to {target_rows:,} rows is above this deployment's cap of "
+                   f"{MAX_GROW_ROWS:,} rows"),
+        )
     with _grow_lock:
         if _grow_state["running"]:
             return _home_response(request, conn, status_code=409, error="a growth is already running")

@@ -94,9 +94,13 @@
 </p>
 <form hx-post="/seed/grow" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/seed/grow" class="flex flex-wrap gap-2 text-sm">
-  <button type="submit" name="target_rows" value="1000000" class="border rounded px-3 py-1.5 hover:bg-slate-100">Grow to 1M rows</button>
-  <button type="submit" name="target_rows" value="10000000" class="border rounded px-3 py-1.5 hover:bg-slate-100">Grow to 10M rows</button>
-  <button type="submit" name="target_rows" value="50000000" class="border rounded px-3 py-1.5 hover:bg-slate-100">Grow to 50M rows</button>
+  {% for n in grow_options %}
+  <button type="submit" name="target_rows" value="{{ n }}"
+          class="border rounded px-3 py-1.5 hover:bg-slate-100">Grow to {{ (n // 1000000) }}M rows</button>
+  {% endfor %}
+  {% if grow_options | length < 3 %}
+  <span class="text-slate-400 text-xs self-center">larger targets are disabled on this deployment</span>
+  {% endif %}
 </form>
 {% if grow_running %}
 <p class="text-amber-700 text-sm mt-2"
