@@ -5,7 +5,30 @@ You branch a schema, edit it independently (add/drop/rename/retype columns, cons
 diff it against `main`, and merge it back — and the merge actually runs as DDL against a real,
 populated Postgres table, with a migration planner that refuses to take the database down doing it.
 
-**Deployed URL:** _(deploy pending — see Deployment below)_
+## Live demo
+
+**Deployed URL:** _(paste the Render URL here once the blueprint finishes deploying)_
+
+> ### ⏳ Please give it 30-60 seconds on the first load
+>
+> This runs on Render's **free** tier, which puts the service to sleep after about 15 minutes of
+> inactivity. The first request after that has to wake the container back up.
+>
+> **A blank page or a slow spinner on your first visit is the service starting, not a broken
+> deployment.** Leave the tab for up to a minute and it will load. Every request after that is
+> fast until it goes idle again.
+>
+> Two other free-tier notes, so nothing reads as a defect:
+>
+> - **The demo caps table growth at 1M rows.** Render's free Postgres allows 1GB; 1M rows measures
+>   ~125MB, and the 10M/50M options would exceed it, so they are hidden and refused there. That is a
+>   limit of the free database, not of the tool — the 5GB evidence is in
+>   [`bench/RESULTS.md`](bench/RESULTS.md), measured on a real 5.016 GiB / 28.4M-row table.
+> - **The free database expires 90 days after creation.** This deployment exists for a review
+>   window, not permanently.
+>
+> Prefer not to wait? `docker compose up` runs the whole thing locally in one command, with no cold
+> start and no row cap — see [Setup](#setup) below.
 
 ---
 
