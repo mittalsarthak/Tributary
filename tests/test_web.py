@@ -805,3 +805,24 @@ def test_merge_base_moves_forward_so_a_second_merge_does_not_replay_the_first(cl
         assert merge_mod.merge_base(conn, branch_head, main_head) == branch_head
     finally:
         conn.close()
+
+
+def test_a_merged_branch_can_still_be_deleted(client):
+    """Regression: `commits.merge_parent_id` had no ON DELETE action.
+
+    Deleting a branch cascades to its commits, but the merge commit on `main`
+    references the branch's head via merge_parent_id -- so Postgres refused with a
+    ForeignKeyViolation and the route returned a bare 500. Deleting a branch after
+    merging it is the single most ordinary thing a user does with this tool.
+    """
+    client.post("/branches", data={"name": "spent"})
+    client.post("/branches/spent/changes",
+                data={"op": "add_column", "table": "users", "name": "spent_col", "type": "text"})
+    client.post("/branches/spent/commit", data={"message": "add spent_col"})
+    mid = _merge_id(client.post("/merges", data={"source": "spent", "target": "main"}).text)
+    client.post(f"/merges/{mid}/run")
+    _wait_for_merge(mid)
+
+    r = client.delete("/branches/spent")
+    assert r.status_code < 500, f"deleting a merged branch returned {r.status_code}"
+    assert "spent" not in client.get("/").text.replace("spent_col", "")

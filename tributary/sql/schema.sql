@@ -18,7 +18,11 @@ CREATE TABLE IF NOT EXISTS _tributary.commits (
   -- whose sole parent is the target's previous head, so the merged branch's
   -- commits never enter the target's ancestry -- the branch looks unmerged
   -- forever, and merge_base rewinds to the original fork point on a re-merge.
-  merge_parent_id uuid REFERENCES _tributary.commits(id),
+  -- ON DELETE SET NULL, not the default: deleting a branch cascades to its
+  -- commits, and the merge commit on the *target* still points at the merged
+  -- branch's head. Without this, deleting a branch after merging it -- the most
+  -- ordinary thing a user does here -- fails with a ForeignKeyViolation.
+  merge_parent_id uuid REFERENCES _tributary.commits(id) ON DELETE SET NULL,
   message    text NOT NULL,
   author     text NOT NULL DEFAULT 'you',
   snapshot   jsonb NOT NULL,
@@ -64,4 +68,13 @@ CREATE TABLE IF NOT EXISTS _tributary.migration_steps (
 -- Existing workspaces predate merge_parent_id; CREATE TABLE IF NOT EXISTS
 -- above will not add it to a table that already exists.
 ALTER TABLE _tributary.commits
-  ADD COLUMN IF NOT EXISTS merge_parent_id uuid REFERENCES _tributary.commits(id);
+  ADD COLUMN IF NOT EXISTS merge_parent_id uuid REFERENCES _tributary.commits(id)
+  ON DELETE SET NULL;
+
+-- Workspaces that got merge_parent_id before it carried ON DELETE SET NULL still
+-- have the strict constraint; re-create it so deleting a merged branch works.
+ALTER TABLE _tributary.commits
+  DROP CONSTRAINT IF EXISTS commits_merge_parent_id_fkey;
+ALTER TABLE _tributary.commits
+  ADD CONSTRAINT commits_merge_parent_id_fkey
+  FOREIGN KEY (merge_parent_id) REFERENCES _tributary.commits(id) ON DELETE SET NULL;
