@@ -7,7 +7,7 @@ populated Postgres table, with a migration planner that refuses to take the data
 
 ## Live demo
 
-**Deployed URL:** _(paste the Render URL here once the blueprint finishes deploying)_
+**Deployed URL: <https://tributary-6j5y.onrender.com/>**
 
 > ### ⏳ Please give it 30-60 seconds on the first load
 >
@@ -73,7 +73,7 @@ TESTCONTAINERS_RYUK_DISABLED=true .venv/bin/pytest
 place.) The cost of disabling Ryuk is a stopped container occasionally left behind after a hard-killed
 run — cheap, and visible in `docker ps -a`, versus a test suite that doesn't run for a stranger.
 
-Current state: **225 passed**, 0 failed.
+Current state: **282 passed**, 0 failed.
 
 **What `tests/test_locks.py` proves.** This is the file that matters most — the mechanised version of
 the project's central claim. Three tests, all against a real live table, none of them mocked:
@@ -102,19 +102,16 @@ work behind it.
    regardless of how large `main.events` is.
 2. **Add a column.** Open the branch, use "Add a column" in the editor — it applies immediately to
    the branch's live schema and records the edit in an uncommitted-changes list.
-3. **Retype `events.event_type`.** The editor's buttons cover the common column edits
-   (add/drop/rename); a type change isn't wired to its own button yet, so do it the same way you
-   would against any real Postgres schema — connect directly and run the `ALTER`:
-   ```
-   docker compose exec db psql -U tributary -d tributary \
-     -c 'ALTER TABLE br_retype_demo.events ALTER COLUMN event_type TYPE varchar(20)'
-   ```
-   (`event_type` seeds as plain `text`; narrowing it to a bounded `varchar` is not
-   binary-coercible — unlike widening `varchar`/`text` the other way, which the planner treats as
-   metadata-only — so it is exactly the kind of retype the safety report exists to catch.) Because
-   a branch *is* an ordinary Postgres schema, that's all it takes — no special API. Go back to the
-   branch page and click **Commit**; committing snapshots whatever the branch's live schema actually
-   looks like, so the retype is captured whether or not it went through the editor's own forms.
+3. **Retype `events.event_type`.** Use **"Retype a column"** in the editor: table `events`, column
+   `event_type`, new type `varchar(20)`. (`event_type` seeds as plain `text`; narrowing it to a
+   bounded `varchar` is *not* binary-coercible — unlike widening `varchar`→`text` the other way,
+   which the planner treats as metadata-only — so it is exactly the kind of retype the safety report
+   exists to catch.) Then click **Commit**.
+
+   A branch is an ordinary Postgres schema, so you can equally connect and run the DDL by hand
+   (`docker compose exec db psql -U tributary -d tributary -c 'ALTER TABLE br_retype_demo.events
+   ALTER COLUMN event_type TYPE varchar(20)'`) — committing snapshots whatever the branch's live
+   schema actually looks like, whether or not the change went through the editor's forms.
 4. **See the safety warning.** Open **diff vs main** on the branch. The diff lists the retype and
    shows the generated plan with its safety badge. The plan is classified against **`main`'s actual
    measured size**, not the branch's (branches are structure-only, so the branch's own `events` table
