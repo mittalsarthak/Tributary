@@ -625,3 +625,183 @@ def test_show_diff_wraps_a_domain_value_error_as_a_sentence(client, monkeypatch)
     assert r.status_code == 404
     assert "ghost" in r.text
     assert "traceback" not in r.text.lower()
+
+
+# --- merge durability across a process restart --------------------------------
+#
+# A merge's session lives in the in-memory `_merges` dict, but the merge itself is
+# durable: `_tributary.merges` and `_tributary.migration_steps` both survive. When
+# the process restarts, the row says "done" while memory says nothing at all, and
+# the UI reported "no such merge" and hung on "Running..." forever.
+#
+# This is not a hypothetical. It happened in a live session: a merge completed in
+# 0.9s, the container was rebuilt a minute later, and the open page's EventSource
+# reconnected into a process with no memory of it. On a platform that restarts
+# dynos it would happen to every merge ever run.
+
+
+def _forget_all_merge_sessions() -> None:
+    """Simulate a process restart: durable rows survive, memory does not."""
+    with web_app._LOCK:
+        web_app._merges.clear()
+
+
+def _completed_merge(client) -> str:
+    client.post("/branches", data={"name": "durable"})
+    client.post("/branches/durable/changes",
+                data={"op": "add_column", "table": "users", "name": "durable_col", "type": "text"})
+    client.post("/branches/durable/commit", data={"message": "add durable_col"})
+    mid = _merge_id(client.post("/merges", data={"source": "durable", "target": "main"}).text)
+    client.post(f"/merges/{mid}/run")
+    _wait_for_merge(mid)
+    return mid
+
+
+def test_a_finished_merge_is_still_viewable_after_the_session_is_lost(client):
+    """The durable row is the source of truth, not the in-memory session."""
+    mid = _completed_merge(client)
+    _forget_all_merge_sessions()
+
+    r = client.get(f"/merges/{mid}")
+    assert r.status_code == 200, "a completed merge must remain viewable after a restart"
+    assert "no such merge" not in r.text.lower()
+    assert "complete" in r.text.lower(), "the page should report the persisted terminal status"
+
+
+def test_the_event_stream_reports_a_finished_merge_rather_than_no_such_merge(client):
+    """Without this, an open browser tab hangs on 'Running...' forever."""
+    mid = _completed_merge(client)
+    _forget_all_merge_sessions()
+
+    with client.stream("GET", f"/merges/{mid}/events") as r:
+        body = "".join(chunk for chunk in r.iter_text())
+
+    assert "no such merge" not in body, (
+        "the stream fell back to an error instead of reading the durable merge row"
+    )
+    assert "event: complete" in body, "a finished merge must emit its completion event"
+    assert '"status": "done"' in body
+
+
+def test_an_unknown_merge_id_is_still_a_clean_404(client):
+    """The fallback must not turn a genuinely bogus id into a hang."""
+    r = client.get("/merges/00000000-0000-0000-0000-000000000000")
+    assert r.status_code == 404
+
+
+# --- merging from the branch list ---------------------------------------------
+#
+# Reaching the merge screen used to mean: branch list -> diff -> "Start merge".
+# That is two clicks through a page you have to know exists, for the action the
+# whole product is about.
+
+
+def _branch_with_a_commit(client, name: str) -> None:
+    client.post("/branches", data={"name": name})
+    client.post(f"/branches/{name}/changes",
+                data={"op": "add_column", "table": "users", "name": f"{name}_col", "type": "text"})
+    client.post(f"/branches/{name}/commit", data={"message": f"add {name}_col"})
+
+
+def test_branch_list_offers_a_merge_action_for_a_branch_with_commits(client):
+    """Asserted via a stable `data-merge-from` hook.
+
+    An earlier version of this test looked for `value="<branch>"` anywhere in the
+    page and passed before the feature existed -- the "create branch from"
+    dropdown contains an <option value="<branch>"> for every branch, so the
+    assertion matched that instead. A test that passes without the feature is
+    worse than no test.
+    """
+    _branch_with_a_commit(client, "mergeable")
+    html = client.get("/").text
+    assert 'data-merge-from="mergeable"' in html, (
+        "the branch list should offer a merge action inline, not only from the diff page"
+    )
+
+
+def test_branch_list_merge_action_opens_the_merge_screen_rather_than_merging(client):
+    """A one-click merge into main from a list row is too easy to hit by accident.
+
+    The action must land on the merge screen, where conflicts and the safety
+    report are shown before anything is applied to a real database.
+    """
+    _branch_with_a_commit(client, "opensscreen")
+    r = client.post("/merges", data={"source": "opensscreen", "target": "main"})
+    assert r.status_code == 200
+    assert "data-merge-id=" in r.text, "should render the merge screen"
+    assert web_app._merges, "a merge session should exist but nothing should have run yet"
+    mid = _merge_id(r.text)
+    with web_app._LOCK:
+        assert web_app._merges[mid].status in ("ready", "conflicts"), (
+            "opening the merge screen must not start executing the merge"
+        )
+
+
+def test_branch_with_nothing_ahead_says_so_instead_of_offering_a_dead_button(client):
+    """`main` itself, and any branch with no commits ahead, has nothing to merge."""
+    client.post("/branches", data={"name": "untouched"})
+    html = client.get("/").text
+    assert 'data-merge-from="untouched"' not in html, (
+        "a branch with no commits ahead should not offer a merge that would do nothing"
+    )
+    assert 'data-merge-from="main"' not in html, "main cannot be merged into itself"
+    assert "nothing to merge" in html, (
+        "say why the action is absent rather than leaving an unexplained gap in the row"
+    )
+
+
+# --- a merged branch must stop looking unmerged --------------------------------
+#
+# `commits.parent_id` is a single column, so the DAG could not represent a merge:
+# merging created a commit on `main` whose only parent was main's previous head.
+# The branch's commits never entered main's ancestry, so `ahead` never fell to 0,
+# the branch list kept offering "merge -> main" for work already merged, and --
+# worse than the cosmetic part -- `merge_base` would still resolve to the original
+# fork point, so re-merging would try to re-apply changes already in main.
+
+
+def test_a_merged_branch_is_no_longer_ahead_of_main(client):
+    client.post("/branches", data={"name": "settled"})
+    client.post("/branches/settled/changes",
+                data={"op": "add_column", "table": "users", "name": "settled_col", "type": "text"})
+    client.post("/branches/settled/commit", data={"message": "add settled_col"})
+
+    before = client.get("/").text
+    assert 'data-merge-from="settled"' in before, "precondition: it has something to merge"
+
+    mid = _merge_id(client.post("/merges", data={"source": "settled", "target": "main"}).text)
+    client.post(f"/merges/{mid}/run")
+    _wait_for_merge(mid)
+
+    after = client.get("/").text
+    assert 'data-merge-from="settled"' not in after, (
+        "a branch whose commits are now in main must stop offering a merge that "
+        "would do nothing"
+    )
+    assert "nothing to merge" in after
+
+
+def test_merge_base_moves_forward_so_a_second_merge_does_not_replay_the_first(client):
+    """The correctness half: after merging, the branch head is in main's ancestry."""
+    from tributary import merge as merge_mod
+    from tributary import store
+
+    client.post("/branches", data={"name": "twice"})
+    client.post("/branches/twice/changes",
+                data={"op": "add_column", "table": "users", "name": "twice_a", "type": "text"})
+    client.post("/branches/twice/commit", data={"message": "a"})
+    mid = _merge_id(client.post("/merges", data={"source": "twice", "target": "main"}).text)
+    client.post(f"/merges/{mid}/run")
+    _wait_for_merge(mid)
+
+    conn = web_app.db.connect(autocommit=True)
+    try:
+        branch_head = store.head(conn, "twice").id
+        main_head = store.head(conn, "main").id
+        assert branch_head in store.ancestors(conn, main_head), (
+            "after a merge, the merged branch's head must be an ancestor of main -- "
+            "otherwise merge_base rewinds to the fork point and replays the merge"
+        )
+        assert merge_mod.merge_base(conn, branch_head, main_head) == branch_head
+    finally:
+        conn.close()

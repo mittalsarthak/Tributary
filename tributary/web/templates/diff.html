@@ -19,7 +19,7 @@
 {{ ui.plan_report(plan) }}
 
 {% if changes %}
-<form hx-post="/merges" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/merges" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/merges" class="mt-4">
   <input type="hidden" name="source" value="{{ branch.name }}">
   <input type="hidden" name="target" value="{{ target.name }}">

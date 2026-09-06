@@ -13,6 +13,12 @@ CREATE TABLE IF NOT EXISTS _tributary.commits (
   id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   branch_id  uuid NOT NULL REFERENCES _tributary.branches(id) ON DELETE CASCADE,
   parent_id  uuid REFERENCES _tributary.commits(id),
+  -- Second parent, set only on a merge commit. Without it the DAG cannot
+  -- represent a merge at all: a merge would create a commit on the target
+  -- whose sole parent is the target's previous head, so the merged branch's
+  -- commits never enter the target's ancestry -- the branch looks unmerged
+  -- forever, and merge_base rewinds to the original fork point on a re-merge.
+  merge_parent_id uuid REFERENCES _tributary.commits(id),
   message    text NOT NULL,
   author     text NOT NULL DEFAULT 'you',
   snapshot   jsonb NOT NULL,
@@ -54,3 +60,8 @@ CREATE TABLE IF NOT EXISTS _tributary.migration_steps (
   finished_at timestamptz,
   UNIQUE (merge_id, seq)
 );
+
+-- Existing workspaces predate merge_parent_id; CREATE TABLE IF NOT EXISTS
+-- above will not add it to a table that already exists.
+ALTER TABLE _tributary.commits
+  ADD COLUMN IF NOT EXISTS merge_parent_id uuid REFERENCES _tributary.commits(id);

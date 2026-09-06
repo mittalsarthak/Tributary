@@ -10,7 +10,7 @@
 <div class="rounded border border-red-300 bg-red-50 text-red-800 px-4 py-3 mb-4">{{ error }}</div>
 {% endif %}
 
-<form hx-post="/branches" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches" class="flex flex-wrap gap-2 items-end mb-6">
   <div>
     <label class="block text-xs text-slate-500">new branch name</label>
@@ -53,9 +53,24 @@
       <td class="py-1 pr-3">{{ row.behind }}</td>
       <td class="py-1 pr-3 text-right whitespace-nowrap">
         {% if row.b.name != "main" %}
+        {% if row.ahead > 0 %}
+        {# Opens the merge screen -- conflicts and the safety report come first.
+           A one-click merge into main from a list row is too easy to hit by accident. #}
+        <form hx-post="/merges" hx-target="main" hx-select="main" hx-swap="innerHTML"
+              method="post" action="/merges" class="inline-block mr-3"
+              data-merge-from="{{ row.b.name }}">
+          <input type="hidden" name="source" value="{{ row.b.name }}">
+          <input type="hidden" name="target" value="main">
+          <button type="submit"
+                  class="bg-slate-900 text-white text-xs px-2 py-1 rounded hover:bg-slate-700">merge
+            &rarr; main</button>
+        </form>
+        {% else %}
+        <span class="text-slate-300 text-xs mr-3" title="no commits ahead of main">nothing to merge</span>
+        {% endif %}
         <a href="/branches/{{ row.b.name }}/diff?target=main" class="text-slate-500 hover:underline text-xs mr-3">diff</a>
         <a href="/branches/{{ row.b.name }}/history" class="text-slate-500 hover:underline text-xs mr-3">history</a>
-        <button hx-delete="/branches/{{ row.b.name }}" hx-target="body" hx-select="body" hx-swap="outerHTML"
+        <button hx-delete="/branches/{{ row.b.name }}" hx-target="main" hx-select="main" hx-swap="innerHTML"
                 hx-confirm="Delete branch '{{ row.b.name }}' and its schema?"
                 class="text-red-700 hover:underline text-xs">delete</button>
         {% endif %}
@@ -77,7 +92,7 @@
   Grow it and watch a retype/index build on this table move from "instant, metadata only"
   to a rewrite warning in the diff/merge safety report.
 </p>
-<form hx-post="/seed/grow" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/seed/grow" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/seed/grow" class="flex flex-wrap gap-2 text-sm">
   <button type="submit" name="target_rows" value="1000000" class="border rounded px-3 py-1.5 hover:bg-slate-100">Grow to 1M rows</button>
   <button type="submit" name="target_rows" value="10000000" class="border rounded px-3 py-1.5 hover:bg-slate-100">Grow to 10M rows</button>

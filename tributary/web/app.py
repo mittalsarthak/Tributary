@@ -888,8 +888,14 @@ def _execute_merge(merge_id: str) -> None:
         executor.run(db.dsn(), tgt.schema_name, state.plan, merge_id=merge_id,
                       on_progress=on_progress)
 
+        # Record the source branch's head as this commit's *second* parent, so the
+        # merged work genuinely enters the target's ancestry. Without it the branch
+        # stays "ahead" forever and a re-merge rewinds to the original fork point
+        # and replays changes already applied.
+        source_head = store.head(conn, state.source)
         store.commit(conn, state.target, f"merge {state.source} into {state.target}",
-                     [{"op": "merge", "source": state.source, "base_commit": state.base_commit}])
+                     [{"op": "merge", "source": state.source, "base_commit": state.base_commit}],
+                     merge_parent=source_head.id)
         with _LOCK:
             state.status = "done"
         _update_merge_row(conn, merge_id, status="done", finished_at=datetime.now(timezone.utc))
@@ -942,6 +948,61 @@ def run_merge(merge_id: str, request: Request, conn=Depends(get_conn)):
     return templates.TemplateResponse(request, "progress.html", {"merge": state})
 
 
+@dataclass
+class _PersistedMerge:
+    """A merge reconstructed from its durable rows, for when the session is gone.
+
+    `_merges` is process memory; `_tributary.merges` and `_tributary.migration_steps`
+    are the source of truth. After a restart the row still says what happened while
+    memory says nothing, and reporting "no such merge" for a merge that demonstrably
+    completed is both wrong and unhelpful -- an open tab hangs on "Running..."
+    forever, and on a platform that restarts processes it would happen to every merge.
+
+    This carries only what `progress.html` and the event stream read.
+    """
+
+    id: str
+    source: str
+    target: str
+    status: str
+    error: str | None
+    events: list[dict]
+
+
+def _load_persisted_merge(conn, merge_id: str) -> _PersistedMerge | None:
+    """Rebuild a merge view from its durable rows, or None if it never existed."""
+    row = conn.execute(
+        "SELECT id::text, source_branch, target_branch, status, error "
+        "FROM _tributary.merges WHERE id = %s",
+        (merge_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    steps = conn.execute(
+        "SELECT seq, status, note FROM _tributary.migration_steps "
+        "WHERE merge_id = %s ORDER BY seq",
+        (merge_id,),
+    ).fetchall()
+    events = [{"seq": s[0], "status": s[1], "table": None, "note": s[2], "info": {}} for s in steps]
+    return _PersistedMerge(row[0], row[1], row[2], row[3], row[4], events)
+
+
+def _merge_view(conn, merge_id: str):
+    """The in-memory session if it exists, else the durable rows. None if neither."""
+    with _LOCK:
+        state = _merges.get(merge_id)
+    return state if state is not None else _load_persisted_merge(conn, merge_id)
+
+
+@app.get("/merges/{merge_id}")
+def show_merge(merge_id: str, request: Request, conn=Depends(get_conn)):
+    """Revisit a merge after the session that started it is gone."""
+    view = _merge_view(conn, merge_id)
+    if view is None:
+        return _error_page(request, 404, f"no such merge {merge_id!r}")
+    return templates.TemplateResponse(request, "progress.html", {"merge": view})
+
+
 @app.get("/merges/{merge_id}/events")
 def merge_events(merge_id: str):
     def gen():
@@ -949,9 +1010,28 @@ def merge_events(merge_id: str):
         while True:
             with _LOCK:
                 state = _merges.get(merge_id)
-                if state is None:
+            if state is None:
+                # Session gone (restart). Fall back to the durable rows so a
+                # finished merge reports its real outcome instead of an error
+                # that leaves the page spinning forever.
+                with db.connect(autocommit=True) as fallback_conn:
+                    persisted = _load_persisted_merge(fallback_conn, merge_id)
+                if persisted is None:
                     yield "event: error\ndata: no such merge\n\n"
                     return
+                for ev in persisted.events[sent:]:
+                    yield f"data: {json.dumps(ev)}\n\n"
+                if persisted.status in ("done", "failed"):
+                    yield (
+                        "event: complete\ndata: "
+                        + json.dumps({"status": persisted.status, "error": persisted.error})
+                        + "\n\n"
+                    )
+                    return
+                sent = len(persisted.events)
+                time.sleep(0.3)
+                continue
+            with _LOCK:
                 new_events = state.events[sent:]
                 sent = len(state.events)
                 status = state.status

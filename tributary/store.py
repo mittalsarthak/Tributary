@@ -167,32 +167,51 @@ def head(conn, branch: str) -> Commit:
 
 
 def ancestors(conn, cid: str) -> list[str]:
-    """Walk the `parent_id` chain from `cid` back to the root commit.
+    """Walk the commit DAG from `cid` back to the root, newest-first, inclusive.
 
-    Newest-first, inclusive of `cid` itself. Deliberately not branch-scoped:
-    a feature branch's ancestor chain runs straight through the commits it
-    branched from on its parent, which is exactly what Task 7's
-    `merge.merge_base` needs to find a lowest common ancestor across two
-    different branches' heads.
+    Deliberately not branch-scoped: a feature branch's ancestry runs straight
+    through the commits it branched from, which is what `merge.merge_base` needs
+    to find a common ancestor across two branches' heads.
+
+    A merge commit has two parents (`merge_parent_id`), so this walks a DAG
+    rather than a chain: both edges are followed, and each commit is reported
+    once. Following only `parent_id` would leave a merged branch's commits
+    outside the target's ancestry, which is what made a merged branch look
+    permanently unmerged and made `merge_base` rewind to the original fork
+    point on a second merge.
+
+    Ordered newest-first by commit time so `merge.merge_base` -- which takes the
+    first commit present in both ancestries -- picks the *most recent* common
+    ancestor rather than an arbitrary one.
     """
-    result: list[str] = []
-    current: str | None = cid
-    while current is not None:
+    seen: set[str] = set()
+    collected: list[tuple[object, str]] = []
+    pending: list[str] = [cid]
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
         row = conn.execute(
-            "SELECT id, parent_id FROM _tributary.commits WHERE id = %s",
+            "SELECT id, parent_id, merge_parent_id, created_at "
+            "FROM _tributary.commits WHERE id = %s",
             (current,),
         ).fetchone()
         if row is None:
             raise ValueError(f"no such commit {current!r}")
-        cur_id, parent_id = row
-        result.append(str(cur_id))
-        current = str(parent_id) if parent_id is not None else None
-    return result
+        cur_id, parent_id, merge_parent_id, created_at = row
+        seen.add(current)
+        collected.append((created_at, str(cur_id)))
+        for nxt in (parent_id, merge_parent_id):
+            if nxt is not None and str(nxt) not in seen:
+                pending.append(str(nxt))
+    collected.sort(key=lambda pair: pair[0], reverse=True)
+    return [cid_ for _, cid_ in collected]
 
 
 # --- commit ------------------------------------------------------------------
 
-def commit(conn, branch: str, message: str, ops: list[dict], author: str = "you") -> str:
+def commit(conn, branch: str, message: str, ops: list[dict], author: str = "you",
+           merge_parent: str | None = None) -> str:
     """Snapshot `branch`'s live schema and record it as a new commit, then
     advance the branch's HEAD to point at it.
     """
@@ -201,9 +220,11 @@ def commit(conn, branch: str, message: str, ops: list[dict], author: str = "you"
 
     with conn.transaction():
         row = conn.execute(
-            "INSERT INTO _tributary.commits (branch_id, parent_id, message, author, snapshot, ops) "
-            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-            (b.id, b.head_commit, message, author, Jsonb(snap.to_json()), Jsonb(ops)),
+            "INSERT INTO _tributary.commits "
+            "(branch_id, parent_id, message, author, snapshot, ops, merge_parent_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (b.id, b.head_commit, message, author, Jsonb(snap.to_json()), Jsonb(ops),
+             merge_parent),
         ).fetchone()
         cid = str(row[0])
         conn.execute(

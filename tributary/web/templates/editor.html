@@ -28,7 +28,7 @@
   <div class="rounded border border-slate-200">
     <div class="bg-slate-100 px-3 py-2 font-mono font-semibold flex items-center justify-between">
       <span>{{ tname }}</span>
-      <button hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+      <button hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
               hx-vals='{"op": "drop_table", "table": "{{ tname }}"}'
               hx-confirm="Drop table &#39;{{ tname }}&#39; and all its data? This cannot be undone."
               class="text-red-700 hover:underline text-xs font-normal">drop table</button>
@@ -54,7 +54,7 @@
 </div>
 
 <h2 class="font-semibold mb-2">Add a column</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="add_column">
@@ -74,7 +74,7 @@
 </form>
 
 <h2 class="font-semibold mb-2">Drop a column</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="drop_column">
@@ -86,7 +86,7 @@
 </form>
 
 <h2 class="font-semibold mb-2">Rename a column</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="rename_column">
@@ -100,7 +100,7 @@
 </form>
 
 <h2 class="font-semibold mb-2">Retype a column</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="alter_column_type">
@@ -114,7 +114,7 @@
 </form>
 
 <h2 class="font-semibold mb-2">Rename a table</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="rename_table">
@@ -126,7 +126,7 @@
 </form>
 
 <h2 class="font-semibold mb-2">Create a table</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="create_table">
@@ -140,7 +140,7 @@
 </form>
 
 <h2 class="font-semibold mb-2">Add a constraint</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="add_constraint">
@@ -155,7 +155,7 @@
 </form>
 
 <h2 class="font-semibold mb-2">Drop a constraint</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="drop_constraint">
@@ -167,7 +167,7 @@
 </form>
 
 <h2 class="font-semibold mb-2">Create an index</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="create_index">
@@ -182,7 +182,7 @@
 </form>
 
 <h2 class="font-semibold mb-2">Drop an index</h2>
-<form hx-post="/branches/{{ branch.name }}/changes" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/changes" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/changes"
       class="flex flex-wrap gap-2 items-end mb-6 text-sm">
   <input type="hidden" name="op" value="drop_index">
@@ -196,7 +196,7 @@
 <hr class="my-6 border-slate-200">
 
 <h2 class="font-semibold mb-2">Commit</h2>
-<form hx-post="/branches/{{ branch.name }}/commit" hx-target="body" hx-select="body" hx-swap="outerHTML"
+<form hx-post="/branches/{{ branch.name }}/commit" hx-target="main" hx-select="main" hx-swap="innerHTML"
       method="post" action="/branches/{{ branch.name }}/commit" class="flex gap-2 items-end text-sm">
   <div class="flex-1"><label class="block text-xs text-slate-500">message</label>
     <input name="message" class="border rounded px-2 py-1 w-full" value="edit" required></div>

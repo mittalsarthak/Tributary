@@ -7,6 +7,8 @@
   <div id="merge-log" class="font-mono text-xs bg-slate-900 text-slate-100 rounded p-3 h-64 overflow-y-auto">
     {% for ev in merge.events %}
     <div>step {{ ev.seq }} [{{ ev.status }}]{% if ev.table %} on {{ ev.table }}{% endif %}: {{ ev.note }}</div>
+    {% else %}
+    <div class="text-slate-400">No steps yet&hellip;</div>
     {% endfor %}
   </div>
   <p id="merge-status" class="mt-3 text-sm text-slate-600">
@@ -14,31 +16,55 @@
     {% elif merge.status == "failed" %}Merge failed: {{ merge.error }}
     {% else %}Running&hellip;{% endif %}
   </p>
+
+  <!-- This script MUST stay inside [data-merge-id]. merge.html starts a run with
+       hx-select="[data-merge-id]", so htmx keeps only that element from the
+       response; a script placed as a sibling is silently dropped, no EventSource is
+       ever created, and the page shows "Running..." forever for a merge that
+       already finished. tests/test_templates.py pins this. -->
+  <script>
+  (function () {
+    var mergeId = {{ merge.id|tojson }};
+    var status = {{ merge.status|tojson }};
+    var log = document.getElementById("merge-log");
+    var statusEl = document.getElementById("merge-status");
+    if (status === "done" || status === "failed") { return; }
+
+    var es = new EventSource("/merges/" + mergeId + "/events");
+    var sawTerminal = false;
+
+    es.onmessage = function (ev) {
+      var data = JSON.parse(ev.data);
+      var placeholder = log.querySelector(".text-slate-400");
+      if (placeholder) { placeholder.remove(); }
+      var line = document.createElement("div");
+      line.textContent = "step " + data.seq + " [" + data.status + "]" +
+        (data.table ? " on " + data.table : "") + ": " + data.note;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    };
+
+    es.addEventListener("complete", function (ev) {
+      var data = JSON.parse(ev.data);
+      sawTerminal = true;
+      statusEl.textContent = data.status === "done"
+        ? "Merge complete."
+        : ("Merge failed: " + (data.error || "unknown error"));
+      es.close();
+    });
+
+    // Closing silently here is how this page used to hang on "Running..." with no
+    // explanation: the stream dropped, the handler swallowed it, and the status
+    // never changed again. Say what happened instead.
+    es.onerror = function () {
+      es.close();
+      if (!sawTerminal) {
+        statusEl.textContent =
+          "Lost the progress stream (the server may have restarted). " +
+          "The merge itself is recorded — reload this page to see its outcome.";
+      }
+    };
+  })();
+  </script>
 </div>
-<script>
-(function () {
-  var mergeId = {{ merge.id|tojson }};
-  var status = {{ merge.status|tojson }};
-  if (status === "done" || status === "failed") { return; }
-  var log = document.getElementById("merge-log");
-  var statusEl = document.getElementById("merge-status");
-  var es = new EventSource("/merges/" + mergeId + "/events");
-  es.onmessage = function (ev) {
-    var data = JSON.parse(ev.data);
-    var line = document.createElement("div");
-    line.textContent = "step " + data.seq + " [" + data.status + "]" +
-      (data.table ? " on " + data.table : "") + ": " + data.note;
-    log.appendChild(line);
-    log.scrollTop = log.scrollHeight;
-  };
-  es.addEventListener("complete", function (ev) {
-    var data = JSON.parse(ev.data);
-    statusEl.textContent = data.status === "done"
-      ? "Merge complete."
-      : ("Merge failed: " + (data.error || "unknown error"));
-    es.close();
-  });
-  es.onerror = function () { es.close(); };
-})();
-</script>
 {% endblock %}

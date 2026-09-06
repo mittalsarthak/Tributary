@@ -6,6 +6,25 @@
 <title>Tributary</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.12/dist/htmx.min.js"></script>
+<script>
+  // Render 4xx/5xx responses instead of discarding them.
+  //
+  // htmx decides whether to swap with (htmx.js:3542):
+  //     shouldSwap = xhr.status >= 200 && xhr.status < 400 && xhr.status !== 204
+  // This app deliberately answers invalid input with a 4xx *and* a rendered error
+  // banner. Without this handler htmx fetches that banner and throws it away, so a
+  // rejected edit looks like a button that simply does nothing -- the worst
+  // possible feedback, because the user cannot tell a validation error from a bug.
+  //
+  // Returning 200 for errors would also make them visible and is the wrong fix: it
+  // lies to the browser, to curl, and to the tests that assert on status codes.
+  document.addEventListener('htmx:beforeSwap', function (evt) {
+    if (evt.detail.xhr && evt.detail.xhr.status >= 400) {
+      evt.detail.shouldSwap = true;   // show the server's error page
+      evt.detail.isError = false;     // it is handled, not an unexpected failure
+    }
+  });
+</script>
 <style>
   body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
 </style>
