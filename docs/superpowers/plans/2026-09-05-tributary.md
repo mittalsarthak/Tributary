@@ -1870,6 +1870,12 @@ git commit -m "feat: seeded demo workspace with a growable events table"
 ## Task 13: Dockerfile and Railway deploy
 
 **Files:**
+> **Superseded after this plan was written.** This task targeted Railway, and the repo was
+> unpublished at the time. Both changed: the user published the repository, and Railway turned out to
+> have had no free tier since 2023. The project now deploys to Render via `render.yaml`; `railway.json`
+> was deleted. Kept here unedited as the record of what was planned — see `decisions.md` §16 for what
+> actually happened and why.
+
 - Create: `Dockerfile`, `.dockerignore`, `railway.json`
 
 - [ ] **Step 1: Write the `Dockerfile`**
